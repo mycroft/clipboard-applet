@@ -42,6 +42,38 @@ cargo test --locked
 cargo clippy --locked -- -D warnings
 ```
 
+## Installation and desktop startup
+
+Install the release binary for the current user:
+
+```sh
+make install
+```
+
+Choose one startup method. For desktop autostart:
+
+```sh
+make install-autostart
+```
+
+The applet starts on the next desktop login. This method requires `~/.local/bin` in the desktop session's `PATH`.
+
+Alternatively, install and enable the systemd user service:
+
+```sh
+make enable-systemd
+```
+
+Inspect it with `systemctl --user status clipboard-applet.service`. The service is tied to `graphical-session.target`. Do not enable both startup methods; single-instance protection prevents corruption, but the second launcher will fail.
+
+Remove the binary and both integration methods with:
+
+```sh
+make uninstall
+```
+
+SIGINT, SIGTERM, and the tray Exit action all leave the main event loop cleanly. As with any exit, Wayland clipboard values owned by the applet may disappear unless a clipboard manager retains them.
+
 ## Configuration
 
 The app reads `$XDG_CONFIG_HOME/clipboard-applet/config.toml`, falling back to `~/.config/clipboard-applet/config.toml`. Without a file, built-in defaults are used.

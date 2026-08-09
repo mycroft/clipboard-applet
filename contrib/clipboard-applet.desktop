@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Clipboard Applet
+Comment=View and manipulate Wayland clipboards
+Exec=clipboard-applet
+Icon=edit-paste
+Terminal=false
+Categories=Utility;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true

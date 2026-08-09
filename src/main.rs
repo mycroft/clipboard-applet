@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use ksni::{ToolTip, TrayMethods};
 use serde::Deserialize;
+use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc;
 use wl_clipboard_rs::copy::{
     ClipboardType as CopyClipboardType, MimeType as CopyMimeType, Options, Seat as CopySeat,
@@ -449,9 +450,23 @@ async fn main() {
             Some(new_poll_interval(polling_period))
         }
     };
+    let mut interrupt_signal = signal(SignalKind::interrupt()).unwrap_or_else(|error| {
+        eprintln!("failed to install SIGINT handler: {error}");
+        std::process::exit(1);
+    });
+    let mut terminate_signal = signal(SignalKind::terminate()).unwrap_or_else(|error| {
+        eprintln!("failed to install SIGTERM handler: {error}");
+        std::process::exit(1);
+    });
     loop {
         let mut check_for_change = false;
         tokio::select! {
+            signal_name = wait_for_shutdown_signal(&mut interrupt_signal, &mut terminate_signal) => {
+                if debug {
+                    eprintln!("[debug] exit requested: source={signal_name}");
+                }
+                break;
+            }
             _ = wait_for_poll(&mut poll_interval) => {
                 check_for_change = true;
             }
@@ -592,6 +607,13 @@ async fn main() {
                 tray.notifications_enabled = notifications_enabled;
             })
             .await;
+    }
+}
+
+async fn wait_for_shutdown_signal(interrupt: &mut Signal, terminate: &mut Signal) -> &'static str {
+    tokio::select! {
+        _ = interrupt.recv() => "SIGINT",
+        _ = terminate.recv() => "SIGTERM",
     }
 }
 

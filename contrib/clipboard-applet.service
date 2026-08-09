@@ -1,0 +1,12 @@
+[Unit]
+Description=Wayland clipboard tray applet
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/clipboard-applet
+Restart=on-abnormal
+
+[Install]
+WantedBy=graphical-session.target
