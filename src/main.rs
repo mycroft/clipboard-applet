@@ -2,6 +2,7 @@ mod cli;
 mod clipboard;
 mod clipboard_monitor;
 mod config;
+mod editor;
 mod notification;
 mod stack;
 mod tray;
@@ -16,14 +17,16 @@ use std::time::Duration;
 use ksni::TrayMethods;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc;
+use wl_clipboard_rs::copy::ClipboardType as CopyClipboardType;
+use wl_clipboard_rs::paste::ClipboardType;
 
 use cli::{CliAction, parse_args, print_help};
-use clipboard::{perform_action, perform_clear, try_read_both};
+use clipboard::{perform_action, perform_clear, read, try_read_both, write};
 use clipboard_monitor::MonitorEvent;
 use config::UpdateMethod;
 use notification::{clipboard_change, send_change, settings as notification_settings};
 use stack::perform as perform_stack_action;
-use tray::{AppEvent, ClipboardTray, tooltip_text};
+use tray::{AppEvent, ClipboardTray, EditTarget, tooltip_text};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -95,6 +98,7 @@ async fn main() {
         stack: Vec::new(),
         hide_content: config.hide_content,
         notifications_enabled,
+        editor_enabled: !config.editor.is_empty(),
     };
     let handle = tray.spawn().await.unwrap_or_else(|error| {
         eprintln!("failed to register tray icon: {error}");
@@ -183,6 +187,27 @@ async fn main() {
                             Err(error) => eprintln!("clipboard clear stopped unexpectedly: {error}"),
                         }
                     }
+                    AppEvent::Edit(target) => {
+                        let command = config.editor.clone();
+                        let mut current_stack = std::mem::take(&mut stack);
+                        let result = tokio::task::spawn_blocking(move || {
+                            let result = perform_edit(
+                                target,
+                                &mut current_stack,
+                                &command,
+                                notifications_enabled,
+                                debug,
+                            );
+                            (result, current_stack)
+                        }).await;
+                        match result {
+                            Ok((result, returned_stack)) => {
+                                stack = returned_stack;
+                                if let Err(error) = result { eprintln!("could not edit clipboard value: {error}"); }
+                            }
+                            Err(error) => eprintln!("clipboard editor stopped unexpectedly: {error}"),
+                        }
+                    }
                     AppEvent::ToggleNotifications => {
                         notifications_enabled = !notifications_enabled;
                         if debug { eprintln!("[debug] notifications toggled: enabled={notifications_enabled}"); }
@@ -237,6 +262,46 @@ async fn main() {
             })
             .await;
     }
+}
+
+fn perform_edit(
+    target: EditTarget,
+    stack: &mut [String],
+    command: &[String],
+    notifications: bool,
+    debug: bool,
+) -> Result<(), String> {
+    if debug {
+        eprintln!("[debug] edit requested: target={target:?}");
+    }
+    let original = match target {
+        EditTarget::Primary => read(ClipboardType::Primary).into_editable("primary")?,
+        EditTarget::Regular => read(ClipboardType::Regular).into_editable("regular")?,
+        EditTarget::Stack(index) => stack
+            .get(index)
+            .cloned()
+            .ok_or_else(|| "stacked entry no longer exists".to_string())?,
+    };
+    let edited = editor::edit(command, &original, debug)?;
+    match target {
+        EditTarget::Primary => write(CopyClipboardType::Primary, edited, debug)?,
+        EditTarget::Regular => write(CopyClipboardType::Regular, edited, debug)?,
+        EditTarget::Stack(index) => replace_stack_entry(stack, index, edited)?,
+    }
+    let sent =
+        notification::send_if_enabled("Clipboard value edited", "clipboard edit", notifications);
+    if sent && debug {
+        eprintln!("[debug] edit notification sent: target={target:?}");
+    }
+    Ok(())
+}
+
+fn replace_stack_entry(stack: &mut [String], index: usize, value: String) -> Result<(), String> {
+    let entry = stack
+        .get_mut(index)
+        .ok_or_else(|| "stacked entry no longer exists".to_string())?;
+    *entry = value;
+    Ok(())
 }
 
 fn new_poll_interval(period: Duration) -> tokio::time::Interval {
@@ -331,5 +396,13 @@ mod tests {
         drop(first);
         drop(acquire_instance_lock(&path).unwrap());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn stack_edit_replaces_in_place() {
+        let mut stack = vec!["oldest".into(), "target".into(), "newest".into()];
+        replace_stack_entry(&mut stack, 1, "edited".into()).unwrap();
+        assert_eq!(stack, ["oldest", "edited", "newest"]);
+        assert!(replace_stack_entry(&mut stack, 3, "missing".into()).is_err());
     }
 }

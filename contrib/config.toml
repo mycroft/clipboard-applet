@@ -25,6 +25,12 @@ notify_on_change = false
 # Freedesktop icon-theme name used for the tray icon.
 icon_name = "edit-paste"
 
+# Editor command as an argument list. The private temporary-file path is
+# appended as the final argument. Leave empty to disable editing. The command
+# must wait until editing finishes; graphical editors may require --wait.
+# Example: ["foot", "-e", "nvim"]
+editor = []
+
 # Maximum number of clipboard texts retained in the in-memory LIFO stack (1-16).
 stack_size = 16
 

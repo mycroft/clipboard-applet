@@ -11,8 +11,16 @@ pub(crate) enum AppEvent {
     Action(ActionRequest),
     Stack(StackAction),
     Clear(ClearTarget),
+    Edit(EditTarget),
     ToggleNotifications,
     Exit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EditTarget {
+    Primary,
+    Regular,
+    Stack(usize),
 }
 
 #[derive(Debug)]
@@ -27,6 +35,7 @@ pub(crate) struct ClipboardTray {
     pub(crate) stack: Vec<String>,
     pub(crate) hide_content: bool,
     pub(crate) notifications_enabled: bool,
+    pub(crate) editor_enabled: bool,
 }
 
 impl ksni::Tray for ClipboardTray {
@@ -112,10 +121,26 @@ impl ksni::Tray for ClipboardTray {
             }
             .into()
         };
+        let edit_item = |label: String, target: EditTarget, enabled: bool| {
+            StandardItem {
+                label,
+                enabled,
+                activate: Box::new(move |tray: &mut Self| {
+                    let _ = tray.event_sender.send(AppEvent::Edit(target));
+                }),
+                ..Default::default()
+            }
+            .into()
+        };
         let any_content =
             has_content(self.primary.as_deref()) || has_content(self.regular.as_deref());
         let mut menu = vec![
             preview_item("Primary", self.primary.as_deref()),
+            edit_item(
+                "Edit primary".into(),
+                EditTarget::Primary,
+                self.editor_enabled && has_content(self.primary.as_deref()),
+            ),
             action_item(
                 "Copy primary to regular",
                 ClipboardAction::CopyPrimary,
@@ -133,6 +158,11 @@ impl ksni::Tray for ClipboardTray {
             ),
             separator_item(),
             preview_item("Regular", self.regular.as_deref()),
+            edit_item(
+                "Edit regular".into(),
+                EditTarget::Regular,
+                self.editor_enabled && has_content(self.regular.as_deref()),
+            ),
             action_item(
                 "Copy regular to primary",
                 ClipboardAction::CopyRegular,
@@ -163,17 +193,26 @@ impl ksni::Tray for ClipboardTray {
                 .into(),
             );
         } else {
-            if !self.hide_content {
-                menu.extend(self.stack.iter().rev().enumerate().map(|(index, value)| {
-                    StandardItem {
-                        label: format!("{}: {}", index + 1, preview(Some(value), false))
-                            .replace('_', "__"),
-                        enabled: false,
-                        ..Default::default()
-                    }
-                    .into()
-                }));
-            }
+            menu.extend(
+                self.stack
+                    .iter()
+                    .rev()
+                    .enumerate()
+                    .map(|(display_index, value)| {
+                        let stack_index = self.stack.len() - 1 - display_index;
+                        let label = if self.hide_content {
+                            format!("Edit stacked entry {}", display_index + 1)
+                        } else {
+                            format!(
+                                "Edit {}: {}",
+                                display_index + 1,
+                                preview(Some(value), false)
+                            )
+                            .replace('_', "__")
+                        };
+                        edit_item(label, EditTarget::Stack(stack_index), self.editor_enabled)
+                    }),
+            );
             menu.extend([
                 stack_item("Pop to primary", StackAction::PopPrimary, true),
                 stack_item("Pop to regular", StackAction::PopRegular, true),
@@ -249,6 +288,26 @@ fn preview(value: Option<&str>, hide: bool) -> String {
 mod tests {
     use super::*;
 
+    fn editable_tray() -> (ClipboardTray, mpsc::UnboundedReceiver<AppEvent>) {
+        let (event_sender, event_receiver) = mpsc::unbounded_channel();
+        (
+            ClipboardTray {
+                tooltip: String::new(),
+                icon_name: "edit-paste".into(),
+                event_sender,
+                left_click: ClipboardAction::CopyPrimary,
+                middle_click: ClipboardAction::Switch,
+                primary: Some("primary".into()),
+                regular: Some("regular".into()),
+                stack: vec!["oldest".into(), "newest".into()],
+                hide_content: false,
+                notifications_enabled: false,
+                editor_enabled: true,
+            },
+            event_receiver,
+        )
+    }
+
     #[test]
     fn preview_hides_content_and_counts_characters() {
         assert_eq!(preview(Some("é🙂"), true), "2 chars");
@@ -275,5 +334,27 @@ mod tests {
             menu_label("Primary", Some("one_two"), false),
             "Primary: one__two"
         );
+    }
+
+    #[test]
+    fn edit_menu_items_send_selection_and_stack_targets() {
+        let (mut tray, mut receiver) = editable_tray();
+        for (label, expected) in [
+            ("Edit primary", EditTarget::Primary),
+            ("Edit regular", EditTarget::Regular),
+            ("Edit 1: newest", EditTarget::Stack(1)),
+            ("Edit 2: oldest", EditTarget::Stack(0)),
+        ] {
+            let item = ksni::Tray::menu(&tray)
+                .into_iter()
+                .find_map(|item| match item {
+                    ksni::MenuItem::Standard(item) if item.label == label => Some(item),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing menu item {label}"));
+            assert!(item.enabled);
+            (item.activate)(&mut tray);
+            assert_eq!(receiver.try_recv(), Ok(AppEvent::Edit(expected)));
+        }
     }
 }

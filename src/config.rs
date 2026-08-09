@@ -31,6 +31,7 @@ pub(crate) struct Config {
     pub(crate) notifications: bool,
     pub(crate) notify_on_change: bool,
     pub(crate) icon_name: String,
+    pub(crate) editor: Vec<String>,
     pub(crate) stack_size: usize,
     pub(crate) left_click: ClipboardAction,
     pub(crate) middle_click: ClipboardAction,
@@ -45,6 +46,7 @@ impl Default for Config {
             notifications: false,
             notify_on_change: false,
             icon_name: "edit-paste".into(),
+            editor: Vec::new(),
             stack_size: 16,
             left_click: ClipboardAction::CopyPrimary,
             middle_click: ClipboardAction::Switch,
@@ -98,6 +100,16 @@ fn parse(contents: &str, path: &Path) -> Result<Config, String> {
     if config.icon_name.trim().is_empty() {
         return Err(format!("{}: icon_name must not be empty", path.display()));
     }
+    if config
+        .editor
+        .first()
+        .is_some_and(|program| program.trim().is_empty())
+    {
+        return Err(format!(
+            "{}: editor program must not be empty",
+            path.display()
+        ));
+    }
     if !(1..=16).contains(&config.stack_size) {
         return Err(format!(
             "{}: stack_size must be between 1 and 16",
@@ -132,6 +144,7 @@ mod tests {
         assert_eq!(config.update_method, UpdateMethod::Events);
         assert_eq!(config.left_click, ClipboardAction::CopyPrimary);
         assert_eq!(config.stack_size, 16);
+        assert!(config.editor.is_empty());
     }
 
     #[test]
@@ -157,5 +170,12 @@ mod tests {
     #[test]
     fn rejects_unknown_fields() {
         assert!(parse("surprise = true", Path::new("config.toml")).is_err());
+    }
+
+    #[test]
+    fn parses_and_validates_editor_argv() {
+        let config = parse("editor = ['foot', '-e', 'nvim']", Path::new("config.toml")).unwrap();
+        assert_eq!(config.editor, ["foot", "-e", "nvim"]);
+        assert!(parse("editor = ['  ']", Path::new("config.toml")).is_err());
     }
 }

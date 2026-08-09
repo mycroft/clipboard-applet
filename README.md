@@ -9,6 +9,7 @@ A small Rust tray applet for viewing and manipulating Wayland primary and regula
 - Configurable left- and middle-click actions.
 - Right-click menu with state-aware clipboard and notification actions.
 - Shared in-memory LIFO stack with push and pop-to-one-or-both operations.
+- Optional editing of clipboard selections and stacked text entries using an external editor.
 - Optional content hiding, notifications, and debug logging.
 - Single-instance protection for each desktop session.
 
@@ -92,6 +93,7 @@ hide_content = false
 notifications = false
 notify_on_change = false
 icon_name = "edit-paste"
+editor = []
 stack_size = 16
 left_click = "COPY_PRIMARY"
 middle_click = "SWITCH"
@@ -116,6 +118,14 @@ Set `notify_on_change = true` to notify when the primary or regular clipboard va
 
 `icon_name` is a Freedesktop icon-theme name resolved by the desktop, not a Unicode character or image path.
 
+`editor` is an argument list for an external editor. Editing is disabled when the list is empty. The applet executes the program directly without a shell and appends a private temporary-file path as the final argument. The command must wait until editing finishes; graphical editors commonly need a wait option. For example:
+
+```toml
+editor = ["foot", "-e", "nvim"]
+```
+
+Edited files larger than 1 MiB are rejected, and the original value is preserved when the editor fails or produces invalid UTF-8.
+
 `stack_size` limits the shared in-memory clipboard stack to between 1 and 16 text entries. The stack is cleared when the applet exits.
 
 Only one applet instance can run in a desktop session. A second process exits with an explanatory error. The advisory lock is released automatically when the running process exits or crashes, so a leftover lock file does not block future starts.
@@ -125,6 +135,7 @@ Only one applet instance can run in a desktop session. A second process exits wi
 - Left and middle click perform their configured actions.
 - Right click opens the action menu.
 - Copy, Stack, Clear, Switch, and Reset entries are disabled when their required clipboard content is empty.
+- Edit actions are enabled for text selections and stack entries when `editor` is configured.
 - Stack entries are listed newest-first unless `hide_content` is enabled. Pop can target primary, regular, or both; an entry is removed only after the write succeeds.
 - When the stack is empty, pop actions are replaced by `No stacked entries yet`.
 - `Enable notifications` / `Disable notifications` changes notification behavior for the current process without modifying the configuration file.

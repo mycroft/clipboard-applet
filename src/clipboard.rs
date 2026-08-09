@@ -85,6 +85,10 @@ impl ClipboardRead {
         }
     }
 
+    pub(crate) fn into_editable(self, source: &str) -> Result<String, String> {
+        self.into_text(source)
+    }
+
     fn into_display(self) -> Result<Option<String>, String> {
         match self {
             Self::Text(value) => Ok(Some(value)),
