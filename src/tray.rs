@@ -134,13 +134,15 @@ impl ksni::Tray for ClipboardTray {
         };
         let any_content =
             has_content(self.primary.as_deref()) || has_content(self.regular.as_deref());
-        let mut menu = vec![
-            preview_item("Primary", self.primary.as_deref()),
-            edit_item(
+        let mut menu = vec![preview_item("Primary", self.primary.as_deref())];
+        if self.editor_enabled {
+            menu.push(edit_item(
                 "Edit primary".into(),
                 EditTarget::Primary,
-                self.editor_enabled && has_content(self.primary.as_deref()),
-            ),
+                has_content(self.primary.as_deref()),
+            ));
+        }
+        menu.extend([
             action_item(
                 "Copy primary to regular",
                 ClipboardAction::CopyPrimary,
@@ -158,11 +160,15 @@ impl ksni::Tray for ClipboardTray {
             ),
             separator_item(),
             preview_item("Regular", self.regular.as_deref()),
-            edit_item(
+        ]);
+        if self.editor_enabled {
+            menu.push(edit_item(
                 "Edit regular".into(),
                 EditTarget::Regular,
-                self.editor_enabled && has_content(self.regular.as_deref()),
-            ),
+                has_content(self.regular.as_deref()),
+            ));
+        }
+        menu.extend([
             action_item(
                 "Copy regular to primary",
                 ClipboardAction::CopyRegular,
@@ -182,7 +188,7 @@ impl ksni::Tray for ClipboardTray {
             action_item("Switch clipboards", ClipboardAction::Switch, any_content),
             action_item("Reset clipboards", ClipboardAction::Reset, any_content),
             separator_item(),
-        ];
+        ]);
         if self.stack.is_empty() {
             menu.push(
                 StandardItem {
@@ -193,26 +199,38 @@ impl ksni::Tray for ClipboardTray {
                 .into(),
             );
         } else {
-            menu.extend(
-                self.stack
-                    .iter()
-                    .rev()
-                    .enumerate()
-                    .map(|(display_index, value)| {
-                        let stack_index = self.stack.len() - 1 - display_index;
-                        let label = if self.hide_content {
-                            format!("Edit stacked entry {}", display_index + 1)
-                        } else {
-                            format!(
-                                "Edit {}: {}",
-                                display_index + 1,
-                                preview(Some(value), false)
-                            )
-                            .replace('_', "__")
-                        };
-                        edit_item(label, EditTarget::Stack(stack_index), self.editor_enabled)
-                    }),
-            );
+            if self.editor_enabled {
+                menu.extend(
+                    self.stack
+                        .iter()
+                        .rev()
+                        .enumerate()
+                        .map(|(display_index, value)| {
+                            let stack_index = self.stack.len() - 1 - display_index;
+                            let label = if self.hide_content {
+                                format!("Edit stacked entry {}", display_index + 1)
+                            } else {
+                                format!(
+                                    "Edit {}: {}",
+                                    display_index + 1,
+                                    preview(Some(value), false)
+                                )
+                                .replace('_', "__")
+                            };
+                            edit_item(label, EditTarget::Stack(stack_index), true)
+                        }),
+                );
+            } else if !self.hide_content {
+                menu.extend(self.stack.iter().rev().enumerate().map(|(index, value)| {
+                    StandardItem {
+                        label: format!("{}: {}", index + 1, preview(Some(value), false))
+                            .replace('_', "__"),
+                        enabled: false,
+                        ..Default::default()
+                    }
+                    .into()
+                }));
+            }
             menu.extend([
                 stack_item("Pop to primary", StackAction::PopPrimary, true),
                 stack_item("Pop to regular", StackAction::PopRegular, true),
@@ -356,5 +374,21 @@ mod tests {
             (item.activate)(&mut tray);
             assert_eq!(receiver.try_recv(), Ok(AppEvent::Edit(expected)));
         }
+    }
+
+    #[test]
+    fn edit_menu_items_are_hidden_without_an_editor() {
+        let (mut tray, _) = editable_tray();
+        tray.editor_enabled = false;
+        let labels: Vec<String> = ksni::Tray::menu(&tray)
+            .into_iter()
+            .filter_map(|item| match item {
+                ksni::MenuItem::Standard(item) => Some(item.label),
+                _ => None,
+            })
+            .collect();
+        assert!(labels.iter().all(|label| !label.starts_with("Edit")));
+        assert!(labels.iter().any(|label| label == "1: newest"));
+        assert!(labels.iter().any(|label| label == "2: oldest"));
     }
 }
