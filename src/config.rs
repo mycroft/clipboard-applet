@@ -5,6 +5,7 @@ use serde::Deserialize;
 use crate::clipboard::ClipboardAction;
 
 const DEFAULT_POLLING_PERIOD_MS: u64 = 1_000;
+const DEFAULT_MAX_CONTENT_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -34,6 +35,8 @@ pub(crate) struct Config {
     pub(crate) editor: Vec<String>,
     pub(crate) stack_enabled: bool,
     pub(crate) stack_size: usize,
+    pub(crate) max_clipboard_bytes: u64,
+    pub(crate) max_stack_entry_bytes: u64,
     pub(crate) left_click: ClipboardAction,
     pub(crate) middle_click: ClipboardAction,
 }
@@ -50,6 +53,8 @@ impl Default for Config {
             editor: Vec::new(),
             stack_enabled: true,
             stack_size: 16,
+            max_clipboard_bytes: DEFAULT_MAX_CONTENT_BYTES,
+            max_stack_entry_bytes: DEFAULT_MAX_CONTENT_BYTES,
             left_click: ClipboardAction::CopyPrimary,
             middle_click: ClipboardAction::Switch,
         }
@@ -118,6 +123,18 @@ fn parse(contents: &str, path: &Path) -> Result<Config, String> {
             path.display()
         ));
     }
+    if config.max_clipboard_bytes == 0 {
+        return Err(format!(
+            "{}: max_clipboard_bytes must be greater than zero",
+            path.display()
+        ));
+    }
+    if config.max_stack_entry_bytes == 0 {
+        return Err(format!(
+            "{}: max_stack_entry_bytes must be greater than zero",
+            path.display()
+        ));
+    }
     Ok(config)
 }
 
@@ -147,6 +164,8 @@ mod tests {
         assert_eq!(config.left_click, ClipboardAction::CopyPrimary);
         assert_eq!(config.stack_size, 16);
         assert!(config.stack_enabled);
+        assert_eq!(config.max_clipboard_bytes, DEFAULT_MAX_CONTENT_BYTES);
+        assert_eq!(config.max_stack_entry_bytes, DEFAULT_MAX_CONTENT_BYTES);
         assert!(config.editor.is_empty());
     }
 
@@ -186,5 +205,18 @@ mod tests {
     fn parses_disabled_stack() {
         let config = parse("stack_enabled = false", Path::new("config.toml")).unwrap();
         assert!(!config.stack_enabled);
+    }
+
+    #[test]
+    fn parses_and_validates_content_limits() {
+        let config = parse(
+            "max_clipboard_bytes = 12\nmax_stack_entry_bytes = 8",
+            Path::new("config.toml"),
+        )
+        .unwrap();
+        assert_eq!(config.max_clipboard_bytes, 12);
+        assert_eq!(config.max_stack_entry_bytes, 8);
+        assert!(parse("max_clipboard_bytes = 0", Path::new("config.toml")).is_err());
+        assert!(parse("max_stack_entry_bytes = 0", Path::new("config.toml")).is_err());
     }
 }

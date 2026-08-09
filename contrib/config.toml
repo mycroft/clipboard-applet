@@ -37,6 +37,13 @@ stack_enabled = true
 # Maximum number of clipboard texts retained in the in-memory LIFO stack (1-16).
 stack_size = 16
 
+# Maximum UTF-8 byte size accepted from either Wayland clipboard. Oversized
+# values are rejected and never copied, stacked, or edited.
+max_clipboard_bytes = 1048576
+
+# Maximum UTF-8 byte size accepted for one stack entry or edited stack value.
+max_stack_entry_bytes = 1048576
+
 # Actions performed when the tray icon is clicked. Supported values:
 # COPY_REGULAR - copy the regular clipboard to the primary clipboard
 # COPY_PRIMARY - copy the primary clipboard to the regular clipboard

@@ -54,6 +54,7 @@ pub(crate) enum ClipboardRead {
     Empty,
     NonText,
     Unsupported,
+    Oversized { limit: u64 },
     Error(String),
 }
 
@@ -64,6 +65,7 @@ impl ClipboardRead {
             Self::Empty => "Empty",
             Self::NonText => "NonText",
             Self::Unsupported => "Unsupported",
+            Self::Oversized { .. } => "Oversized",
             Self::Error(_) => "Error",
         }
     }
@@ -81,6 +83,9 @@ impl ClipboardRead {
             Self::Empty => Err(format!("{source} clipboard is empty")),
             Self::NonText => Err(format!("{source} clipboard does not contain text")),
             Self::Unsupported => Err(format!("{source} clipboard is unsupported")),
+            Self::Oversized { limit } => Err(format!(
+                "{source} clipboard exceeds the configured {limit}-byte limit"
+            )),
             Self::Error(error) => Err(format!("could not read {source} clipboard: {error}")),
         }
     }
@@ -93,48 +98,71 @@ impl ClipboardRead {
         match self {
             Self::Text(value) => Ok(Some(value)),
             Self::Empty | Self::NonText | Self::Unsupported => Ok(None),
+            Self::Oversized { limit } => Err(format!(
+                "clipboard content exceeds the configured {limit}-byte limit"
+            )),
             Self::Error(error) => Err(error),
         }
     }
 }
 
-pub(crate) fn read_both() -> (Option<String>, Option<String>) {
-    try_read_both().unwrap_or_else(|error| {
+pub(crate) fn read_both(max_bytes: u64) -> (Option<String>, Option<String>) {
+    try_read_both(max_bytes).unwrap_or_else(|error| {
         eprintln!("could not read clipboards: {error}");
         (None, None)
     })
 }
 
-pub(crate) fn try_read_both() -> Result<(Option<String>, Option<String>), String> {
+pub(crate) fn try_read_both(max_bytes: u64) -> Result<(Option<String>, Option<String>), String> {
     Ok((
-        read(ClipboardType::Primary).into_display()?,
-        read(ClipboardType::Regular).into_display()?,
+        read(ClipboardType::Primary, max_bytes).into_display()?,
+        read(ClipboardType::Regular, max_bytes).into_display()?,
     ))
 }
 
-pub(crate) fn read(clipboard: ClipboardType) -> ClipboardRead {
-    let (mut pipe, _) = match get_contents(clipboard, Seat::Unspecified, MimeType::Text) {
+pub(crate) fn read(clipboard: ClipboardType, max_bytes: u64) -> ClipboardRead {
+    let (pipe, _) = match get_contents(clipboard, Seat::Unspecified, MimeType::Text) {
         Ok(contents) => contents,
         Err(Error::ClipboardEmpty) => return ClipboardRead::Empty,
         Err(Error::NoMimeType) => return ClipboardRead::NonText,
         Err(Error::PrimarySelectionUnsupported) => return ClipboardRead::Unsupported,
         Err(error) => return ClipboardRead::Error(error.to_string()),
     };
+    read_text(pipe, max_bytes)
+}
+
+fn read_text(reader: impl Read, max_bytes: u64) -> ClipboardRead {
     let mut bytes = Vec::new();
-    match pipe.read_to_end(&mut bytes) {
-        Ok(_) => ClipboardRead::Text(String::from_utf8_lossy(&bytes).into_owned()),
+    match reader
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+    {
+        Ok(_) if bytes.len() as u64 > max_bytes => ClipboardRead::Oversized { limit: max_bytes },
+        Ok(_) => {
+            let value = String::from_utf8_lossy(&bytes).into_owned();
+            if value.len() as u64 > max_bytes {
+                ClipboardRead::Oversized { limit: max_bytes }
+            } else {
+                ClipboardRead::Text(value)
+            }
+        }
         Err(error) => ClipboardRead::Error(format!("could not receive contents: {error}")),
     }
 }
 
 pub(crate) fn perform_action(
     action: ClipboardAction,
+    max_bytes: u64,
     notifications: bool,
     debug: bool,
 ) -> Result<(), String> {
-    apply_action(action, debug, read, write, || {
-        clear(CopyClipboardType::Both, CopySeat::All).map_err(|error| error.to_string())
-    })?;
+    apply_action(
+        action,
+        debug,
+        |clipboard| read(clipboard, max_bytes),
+        write,
+        || clear(CopyClipboardType::Both, CopySeat::All).map_err(|error| error.to_string()),
+    )?;
     let notification_sent =
         notification::send_if_enabled(action_notification(action), "clipboard", notifications);
     if notification_sent && debug {
@@ -345,6 +373,7 @@ mod tests {
             ClipboardRead::Empty,
             ClipboardRead::NonText,
             ClipboardRead::Unsupported,
+            ClipboardRead::Oversized { limit: 10 },
             ClipboardRead::Error("read failed".into()),
         ]
     }
@@ -383,6 +412,7 @@ mod tests {
         assert_eq!(ClipboardRead::Empty.state(), "Empty");
         assert_eq!(ClipboardRead::NonText.state(), "NonText");
         assert_eq!(ClipboardRead::Unsupported.state(), "Unsupported");
+        assert_eq!(ClipboardRead::Oversized { limit: 10 }.state(), "Oversized");
         assert_eq!(ClipboardRead::Error("failed".into()).state(), "Error");
     }
 
@@ -542,5 +572,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(clears, 1);
+    }
+
+    #[test]
+    fn clipboard_read_limit_accepts_below_and_at_but_rejects_above() {
+        assert_eq!(
+            read_text("123".as_bytes(), 4),
+            ClipboardRead::Text("123".into())
+        );
+        assert_eq!(
+            read_text("1234".as_bytes(), 4),
+            ClipboardRead::Text("1234".into())
+        );
+        assert_eq!(
+            read_text("12345".as_bytes(), 4),
+            ClipboardRead::Oversized { limit: 4 }
+        );
+        assert_eq!(
+            read_text([0xff].as_slice(), 1),
+            ClipboardRead::Oversized { limit: 1 }
+        );
     }
 }

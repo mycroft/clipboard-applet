@@ -2,10 +2,13 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::Command;
 
-const MAX_EDITED_BYTES: u64 = 1024 * 1024;
-
-pub(crate) fn edit(command: &[String], original: &str, debug: bool) -> Result<String, String> {
-    edit_with(command, original, debug, |command, path| {
+pub(crate) fn edit(
+    command: &[String],
+    original: &str,
+    max_bytes: u64,
+    debug: bool,
+) -> Result<String, String> {
+    edit_with(command, original, max_bytes, debug, |command, path| {
         let status = Command::new(&command[0])
             .args(&command[1..])
             .arg(path)
@@ -15,7 +18,13 @@ pub(crate) fn edit(command: &[String], original: &str, debug: bool) -> Result<St
     })
 }
 
-fn edit_with<F>(command: &[String], original: &str, debug: bool, run: F) -> Result<String, String>
+fn edit_with<F>(
+    command: &[String],
+    original: &str,
+    max_bytes: u64,
+    debug: bool,
+    run: F,
+) -> Result<String, String>
 where
     F: FnOnce(&[String], &Path) -> Result<bool, String>,
 {
@@ -42,9 +51,9 @@ where
         .metadata()
         .map_err(|error| format!("could not inspect edited value: {error}"))?
         .len();
-    if length > MAX_EDITED_BYTES + 1 {
+    if length > max_bytes.saturating_add(1) {
         return Err(format!(
-            "edited value is too large ({length} bytes; limit is {MAX_EDITED_BYTES})"
+            "edited value is too large ({length} bytes; limit is {max_bytes})"
         ));
     }
     file.as_file_mut()
@@ -57,9 +66,9 @@ where
     if bytes.last() == Some(&b'\n') {
         bytes.pop();
     }
-    if bytes.len() as u64 > MAX_EDITED_BYTES {
+    if bytes.len() as u64 > max_bytes {
         return Err(format!(
-            "edited value is too large ({} bytes; limit is {MAX_EDITED_BYTES})",
+            "edited value is too large ({} bytes; limit is {max_bytes})",
             bytes.len()
         ));
     }
@@ -78,9 +87,11 @@ where
 mod tests {
     use super::*;
 
+    const LIMIT: u64 = 1024;
+
     #[test]
     fn successful_edit_returns_replacement() {
-        let value = edit_with(&["editor".into()], "original", false, |_, path| {
+        let value = edit_with(&["editor".into()], "original", LIMIT, false, |_, path| {
             std::fs::write(path, "edited").map_err(|error| error.to_string())?;
             Ok(true)
         })
@@ -94,7 +105,7 @@ mod tests {
             ("without newline", "without newline\n"),
             ("with newline\n", "with newline\n\n"),
         ] {
-            let value = edit_with(&["editor".into()], original, false, |_, path| {
+            let value = edit_with(&["editor".into()], original, LIMIT, false, |_, path| {
                 let contents = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
                 assert_eq!(contents, expected_file);
                 Ok(true)
@@ -111,7 +122,7 @@ mod tests {
             ("edited\n\n", "edited\n"),
             ("edited", "edited"),
         ] {
-            let value = edit_with(&["editor".into()], "original", false, |_, path| {
+            let value = edit_with(&["editor".into()], "original", LIMIT, false, |_, path| {
                 std::fs::write(path, edited_file).map_err(|error| error.to_string())?;
                 Ok(true)
             })
@@ -122,7 +133,7 @@ mod tests {
 
     #[test]
     fn empty_output_is_valid() {
-        let value = edit_with(&["editor".into()], "original", false, |_, path| {
+        let value = edit_with(&["editor".into()], "original", LIMIT, false, |_, path| {
             std::fs::write(path, "").map_err(|error| error.to_string())?;
             Ok(true)
         })
@@ -132,17 +143,32 @@ mod tests {
 
     #[test]
     fn failed_editor_preserves_original_by_returning_an_error() {
-        assert!(edit_with(&["editor".into()], "original", false, |_, _| Ok(false)).is_err());
+        assert!(
+            edit_with(&["editor".into()], "original", LIMIT, false, |_, _| Ok(
+                false
+            ))
+            .is_err()
+        );
     }
 
     #[test]
     fn oversized_output_is_rejected() {
-        let result = edit_with(&["editor".into()], "original", false, |_, path| {
+        let result = edit_with(&["editor".into()], "original", LIMIT, false, |_, path| {
             let file = std::fs::File::create(path).map_err(|error| error.to_string())?;
-            file.set_len(MAX_EDITED_BYTES + 1)
-                .map_err(|error| error.to_string())?;
+            file.set_len(LIMIT + 2).map_err(|error| error.to_string())?;
             Ok(true)
         });
         assert!(result.unwrap_err().contains("too large"));
+    }
+
+    #[test]
+    fn edited_output_limit_accepts_below_and_at_but_rejects_above() {
+        for (edited, expected) in [("123\n", true), ("1234\n", true), ("12345\n", false)] {
+            let result = edit_with(&["editor".into()], "original", 4, false, |_, path| {
+                std::fs::write(path, edited).map_err(|error| error.to_string())?;
+                Ok(true)
+            });
+            assert_eq!(result.is_ok(), expected);
+        }
     }
 }

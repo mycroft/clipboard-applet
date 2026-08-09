@@ -37,6 +37,7 @@ pub(crate) struct ClipboardTray {
     pub(crate) notifications_enabled: bool,
     pub(crate) editor_enabled: bool,
     pub(crate) stack_enabled: bool,
+    pub(crate) max_clipboard_bytes: u64,
 }
 
 impl ksni::Tray for ClipboardTray {
@@ -268,7 +269,7 @@ impl ksni::Tray for ClipboardTray {
         menu
     }
     fn menu_about_to_show(&mut self) {
-        (self.primary, self.regular) = read_both();
+        (self.primary, self.regular) = read_both(self.max_clipboard_bytes);
     }
 }
 
@@ -296,12 +297,18 @@ fn preview(value: Option<&str>, hide: bool) -> String {
     let Some(value) = value else {
         return "(empty)".into();
     };
-    let value = value.replace(['\n', '\r', '\t'], " ");
     let total = value.chars().count();
+    let visible: String = value
+        .chars()
+        .take(PREVIEW_CHARS)
+        .map(|character| match character {
+            '\n' | '\r' | '\t' => ' ',
+            character => character,
+        })
+        .collect();
     if total <= PREVIEW_CHARS {
-        return value;
+        return visible;
     }
-    let visible: String = value.chars().take(PREVIEW_CHARS).collect();
     format!("{visible}... (and {} more chars)", total - PREVIEW_CHARS)
 }
 
@@ -325,6 +332,7 @@ mod tests {
                 notifications_enabled: false,
                 editor_enabled: true,
                 stack_enabled: true,
+                max_clipboard_bytes: 1024,
             },
             event_receiver,
         )

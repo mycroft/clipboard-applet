@@ -96,6 +96,8 @@ icon_name = "edit-paste"
 editor = []
 stack_enabled = true
 stack_size = 16
+max_clipboard_bytes = 1048576
+max_stack_entry_bytes = 1048576
 left_click = "COPY_PRIMARY"
 middle_click = "SWITCH"
 ```
@@ -128,6 +130,8 @@ editor = ["foot", "-e", "nvim"]
 Edited files larger than 1 MiB are rejected, and the original value is preserved when the editor fails or produces invalid UTF-8.
 
 `stack_enabled = false` removes all stack actions and entries from the tray menu. `stack_size` limits the enabled shared in-memory clipboard stack to between 1 and 16 text entries. The stack is cleared when the applet exits.
+
+`max_clipboard_bytes` limits each text value read from Wayland. `max_stack_entry_bytes` limits each stacked or edited stack value. Both limits are measured in UTF-8 bytes and default to 1 MiB. Oversized values are rejected rather than truncated, leaving existing destinations and stack entries unchanged.
 
 Only one applet instance can run in a desktop session. A second process exits with an explanatory error. The advisory lock is released automatically when the running process exits or crashes, so a leftover lock file does not block future starts.
 

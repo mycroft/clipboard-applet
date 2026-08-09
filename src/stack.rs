@@ -19,6 +19,8 @@ pub(crate) fn perform(
     action: StackAction,
     stack: &mut Vec<String>,
     capacity: usize,
+    max_clipboard_bytes: u64,
+    max_entry_bytes: u64,
     notifications: bool,
     debug: bool,
 ) -> Result<(), String> {
@@ -29,7 +31,7 @@ pub(crate) fn perform(
             } else {
                 ClipboardType::Regular
             };
-            let source = read(clipboard);
+            let source = read(clipboard, max_clipboard_bytes);
             if debug {
                 eprintln!(
                     "[debug] stack push: source={clipboard:?}, state={}, length={} chars",
@@ -46,10 +48,16 @@ pub(crate) fn perform(
                     return Err("source clipboard does not contain text".into());
                 }
                 ClipboardRead::Unsupported => return Err("source clipboard is unsupported".into()),
+                ClipboardRead::Oversized { limit } => {
+                    return Err(format!(
+                        "source clipboard exceeds the configured {limit}-byte limit"
+                    ));
+                }
                 ClipboardRead::Error(error) => {
                     return Err(format!("could not read source clipboard: {error}"));
                 }
             };
+            validate_entry_size(&value, max_entry_bytes)?;
             push(stack, value, capacity);
         }
         StackAction::PopPrimary | StackAction::PopRegular => {
@@ -57,6 +65,7 @@ pub(crate) fn perform(
                 .last()
                 .cloned()
                 .ok_or_else(|| "clipboard stack is empty".to_string())?;
+            validate_clipboard_size(&value, max_clipboard_bytes)?;
             let clipboard = if action == StackAction::PopPrimary {
                 CopyClipboardType::Primary
             } else {
@@ -71,7 +80,13 @@ pub(crate) fn perform(
             write(clipboard, value, debug)?;
             stack.pop();
         }
-        StackAction::PopBoth => pop_to_both(stack, debug, try_read_both, write)?,
+        StackAction::PopBoth => pop_to_both(
+            stack,
+            debug,
+            max_clipboard_bytes,
+            || try_read_both(max_clipboard_bytes),
+            write,
+        )?,
     }
     let notification_sent =
         notification::send_if_enabled(notification_body(action), "clipboard stack", notifications);
@@ -83,9 +98,30 @@ pub(crate) fn perform(
     Ok(())
 }
 
+fn validate_entry_size(value: &str, max_bytes: u64) -> Result<(), String> {
+    let length = value.len() as u64;
+    if length > max_bytes {
+        return Err(format!(
+            "stack entry is too large ({length} bytes; limit is {max_bytes})"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_clipboard_size(value: &str, max_bytes: u64) -> Result<(), String> {
+    let length = value.len() as u64;
+    if length > max_bytes {
+        return Err(format!(
+            "stacked value is too large for the clipboard ({length} bytes; limit is {max_bytes})"
+        ));
+    }
+    Ok(())
+}
+
 fn pop_to_both<FRead, FWrite>(
     stack: &mut Vec<String>,
     debug: bool,
+    max_clipboard_bytes: u64,
     read: FRead,
     write: FWrite,
 ) -> Result<(), String>
@@ -97,6 +133,7 @@ where
         .last()
         .cloned()
         .ok_or_else(|| "clipboard stack is empty".to_string())?;
+    validate_clipboard_size(&value, max_clipboard_bytes)?;
     let (original_primary, original_regular) = read()?;
     let original_primary = original_primary.ok_or_else(|| {
         "cannot safely pop to both when the primary clipboard has no readable text".to_string()
@@ -143,11 +180,26 @@ mod tests {
     }
 
     #[test]
+    fn stack_entry_limit_accepts_below_and_at_but_rejects_above() {
+        assert!(validate_entry_size("123", 4).is_ok());
+        assert!(validate_entry_size("1234", 4).is_ok());
+        assert!(validate_entry_size("12345", 4).is_err());
+    }
+
+    #[test]
+    fn clipboard_write_limit_accepts_below_and_at_but_rejects_above() {
+        assert!(validate_clipboard_size("123", 4).is_ok());
+        assert!(validate_clipboard_size("1234", 4).is_ok());
+        assert!(validate_clipboard_size("12345", 4).is_err());
+    }
+
+    #[test]
     fn failed_pop_to_both_keeps_entry() {
         let mut stack = vec!["value".into()];
         let result = pop_to_both(
             &mut stack,
             false,
+            1024,
             || Ok((Some("old".into()), None)),
             |clipboard, _, _| {
                 if clipboard == CopyClipboardType::Regular {
@@ -168,6 +220,7 @@ mod tests {
         let result = pop_to_both(
             &mut stack,
             false,
+            1024,
             || Ok((None, Some("regular".into()))),
             |clipboard, value, _| {
                 writes.push((clipboard, value));
