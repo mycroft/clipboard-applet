@@ -1,0 +1,29 @@
+# Clipboard applet configuration
+#
+# Install as $XDG_CONFIG_HOME/clipboard-applet/config.toml, or as
+# ~/.config/clipboard-applet/config.toml when XDG_CONFIG_HOME is unset.
+
+# How often to refresh the clipboard previews, in milliseconds.
+# Must be greater than zero.
+polling_period_ms = 1000
+
+# Hide clipboard text in the tooltip and right-click menu. When enabled,
+# only the number of characters in each clipboard is shown.
+hide_content = false
+
+# Send a desktop notification after a successful clipboard action.
+notifications = false
+
+# Freedesktop icon-theme name used for the tray icon.
+icon_name = "edit-paste"
+
+# Maximum number of clipboard texts retained in the in-memory LIFO stack (1-16).
+stack_size = 16
+
+# Actions performed when the tray icon is clicked. Supported values:
+# COPY_REGULAR - copy the regular clipboard to the primary clipboard
+# COPY_PRIMARY - copy the primary clipboard to the regular clipboard
+# RESET        - clear both clipboards
+# SWITCH       - swap the two clipboards
+left_click = "COPY_PRIMARY"
+middle_click = "SWITCH"

@@ -1,0 +1,12 @@
+[package]
+name = "clipboard-applet"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ksni = "0.3.6"
+notify-rust = "4.18.0"
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+toml = "1.1.4"
+wl-clipboard-rs = "0.9.3"

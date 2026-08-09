@@ -1,0 +1,9 @@
+# Copy this file to $XDG_CONFIG_HOME/clipboard-applet/config.toml,
+# or ~/.config/clipboard-applet/config.toml when XDG_CONFIG_HOME is unset.
+polling_period_ms = 1000
+hide_content = false
+notifications = true
+icon_name = "edit-paste"
+stack_size = 16
+left_click = "COPY_PRIMARY"
+middle_click = "SWITCH"
