@@ -883,8 +883,13 @@ fn swap_clipboards(debug: bool) -> Result<(), String> {
             clipboard_length(regular.as_deref())
         );
     }
-    write_clipboard(CopyClipboardType::Primary, regular, debug)?;
-    write_clipboard(CopyClipboardType::Regular, primary, debug)
+    write_primary_and_regular_with_rollback(
+        regular,
+        primary.clone(),
+        primary,
+        debug,
+        write_clipboard,
+    )
 }
 
 fn perform_action(action: ClipboardAction, notifications: bool, debug: bool) -> Result<(), String> {
@@ -1016,19 +1021,7 @@ fn perform_stack_action(
             stack.pop();
         }
         StackAction::PopBoth => {
-            let value = stack
-                .last()
-                .cloned()
-                .ok_or_else(|| "clipboard stack is empty".to_string())?;
-            if debug {
-                eprintln!(
-                    "[debug] stack pop: destination=Primary+Regular, length={} chars",
-                    value.chars().count()
-                );
-            }
-            write_clipboard(CopyClipboardType::Primary, Some(value.clone()), debug)?;
-            write_clipboard(CopyClipboardType::Regular, Some(value), debug)?;
-            stack.pop();
+            pop_stack_to_both(stack, debug, try_read_clipboards, write_clipboard)?;
         }
     }
 
@@ -1045,6 +1038,40 @@ fn perform_stack_action(
     } else if debug {
         eprintln!("[debug] stack notification skipped: disabled");
     }
+    Ok(())
+}
+
+fn pop_stack_to_both<FRead, FWrite>(
+    stack: &mut Vec<String>,
+    debug: bool,
+    read: FRead,
+    write: FWrite,
+) -> Result<(), String>
+where
+    FRead: FnOnce() -> Result<(Option<String>, Option<String>), String>,
+    FWrite: FnMut(CopyClipboardType, Option<String>, bool) -> Result<(), String>,
+{
+    let value = stack
+        .last()
+        .cloned()
+        .ok_or_else(|| "clipboard stack is empty".to_string())?;
+    let (original_primary, original_regular) = read()?;
+    if debug {
+        eprintln!(
+            "[debug] stack pop: destination=Primary+Regular, length={} chars, original_primary={} chars, original_regular={} chars",
+            value.chars().count(),
+            clipboard_length(original_primary.as_deref()),
+            clipboard_length(original_regular.as_deref())
+        );
+    }
+    write_primary_and_regular_with_rollback(
+        Some(value.clone()),
+        Some(value),
+        original_primary,
+        debug,
+        write,
+    )?;
+    stack.pop();
     Ok(())
 }
 
@@ -1067,6 +1094,52 @@ fn stack_action_notification(action: StackAction) -> &'static str {
 
 fn clipboard_length(value: Option<&str>) -> usize {
     value.map_or(0, |value| value.chars().count())
+}
+
+fn write_primary_and_regular_with_rollback<F>(
+    primary: Option<String>,
+    regular: Option<String>,
+    original_primary: Option<String>,
+    debug: bool,
+    mut write: F,
+) -> Result<(), String>
+where
+    F: FnMut(CopyClipboardType, Option<String>, bool) -> Result<(), String>,
+{
+    if let Err(error) = write(CopyClipboardType::Primary, primary, debug) {
+        if debug {
+            eprintln!("[debug] multi-write failed: step=Primary, error={error}");
+        }
+        return Err(format!("could not write primary clipboard: {error}"));
+    }
+
+    if let Err(error) = write(CopyClipboardType::Regular, regular, debug) {
+        if debug {
+            eprintln!("[debug] multi-write failed: step=Regular, error={error}");
+        }
+        return match write(CopyClipboardType::Primary, original_primary, debug) {
+            Ok(()) => {
+                if debug {
+                    eprintln!("[debug] multi-write rollback completed: destination=Primary");
+                }
+                Err(format!(
+                    "could not write regular clipboard: {error}; primary clipboard restored"
+                ))
+            }
+            Err(rollback_error) => {
+                if debug {
+                    eprintln!(
+                        "[debug] multi-write rollback failed: destination=Primary, error={rollback_error}"
+                    );
+                }
+                Err(format!(
+                    "could not write regular clipboard: {error}; could not restore primary clipboard: {rollback_error}"
+                ))
+            }
+        };
+    }
+
+    Ok(())
 }
 
 fn write_clipboard(
@@ -1674,6 +1747,127 @@ mod tests {
         let mut stack = vec!["oldest".into(), "middle".into()];
         push_stack(&mut stack, "newest".into(), 2);
         assert_eq!(stack, ["middle", "newest"]);
+    }
+
+    #[test]
+    fn multi_write_stops_after_first_write_failure() {
+        let mut calls = 0;
+        let error = write_primary_and_regular_with_rollback(
+            Some("new primary".into()),
+            Some("new regular".into()),
+            Some("old primary".into()),
+            false,
+            |_, _, _| {
+                calls += 1;
+                Err("first failed".into())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(calls, 1);
+        assert!(error.contains("primary clipboard"));
+    }
+
+    #[test]
+    fn second_write_failure_attempts_rollback() {
+        let mut calls = 0;
+        let error = write_primary_and_regular_with_rollback(
+            Some("new primary".into()),
+            Some("new regular".into()),
+            Some("old primary".into()),
+            false,
+            |_, _, _| {
+                calls += 1;
+                if calls == 2 {
+                    Err("second failed".into())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(calls, 3);
+        assert!(error.contains("regular clipboard"));
+    }
+
+    #[test]
+    fn successful_rollback_restores_original_primary() {
+        let mut calls = 0;
+        let mut writes = Vec::new();
+        let error = write_primary_and_regular_with_rollback(
+            Some("new primary".into()),
+            Some("new regular".into()),
+            Some("old primary".into()),
+            false,
+            |clipboard, value, _| {
+                calls += 1;
+                writes.push((format!("{clipboard:?}"), value));
+                if calls == 2 {
+                    Err("second failed".into())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(writes[2], ("Primary".into(), Some("old primary".into())));
+        assert!(error.contains("primary clipboard restored"));
+    }
+
+    #[test]
+    fn rollback_failure_reports_both_errors() {
+        let mut calls = 0;
+        let error = write_primary_and_regular_with_rollback(
+            Some("new primary".into()),
+            Some("new regular".into()),
+            Some("old primary".into()),
+            false,
+            |_, _, _| {
+                calls += 1;
+                match calls {
+                    2 => Err("second failed".into()),
+                    3 => Err("rollback failed".into()),
+                    _ => Ok(()),
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(calls, 3);
+        assert!(error.contains("second failed"));
+        assert!(error.contains("rollback failed"));
+    }
+
+    #[test]
+    fn pop_both_removes_entry_only_after_both_writes_succeed() {
+        let mut stack = vec!["stacked".into()];
+        let mut calls = 0;
+        let result = pop_stack_to_both(
+            &mut stack,
+            false,
+            || Ok((Some("primary".into()), Some("regular".into()))),
+            |_, _, _| {
+                calls += 1;
+                if calls == 2 {
+                    Err("second failed".into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(stack, ["stacked"]);
+
+        pop_stack_to_both(
+            &mut stack,
+            false,
+            || Ok((Some("primary".into()), Some("regular".into()))),
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+        assert!(stack.is_empty());
     }
 
     #[test]
