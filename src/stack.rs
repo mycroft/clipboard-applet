@@ -1,7 +1,9 @@
 use wl_clipboard_rs::copy::ClipboardType as CopyClipboardType;
 use wl_clipboard_rs::paste::ClipboardType;
 
-use crate::clipboard::{length, try_read, try_read_both, write, write_both_with_rollback};
+use crate::clipboard::{
+    ClipboardRead, length, read, try_read_both, write, write_both_with_rollback,
+};
 use crate::notification;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,15 +29,27 @@ pub(crate) fn perform(
             } else {
                 ClipboardType::Regular
             };
-            let value = try_read(clipboard)?
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| "source clipboard is empty".to_string())?;
+            let source = read(clipboard);
             if debug {
                 eprintln!(
-                    "[debug] stack push: source={clipboard:?}, length={} chars",
-                    value.chars().count()
+                    "[debug] stack push: source={clipboard:?}, state={}, length={} chars",
+                    source.state(),
+                    source.text_length()
                 );
             }
+            let value = match source {
+                ClipboardRead::Text(value) if !value.is_empty() => value,
+                ClipboardRead::Text(_) | ClipboardRead::Empty => {
+                    return Err("source clipboard is empty".into());
+                }
+                ClipboardRead::NonText => {
+                    return Err("source clipboard does not contain text".into());
+                }
+                ClipboardRead::Unsupported => return Err("source clipboard is unsupported".into()),
+                ClipboardRead::Error(error) => {
+                    return Err(format!("could not read source clipboard: {error}"));
+                }
+            };
             push(stack, value, capacity);
         }
         StackAction::PopPrimary | StackAction::PopRegular => {
@@ -54,7 +68,7 @@ pub(crate) fn perform(
                     value.chars().count()
                 );
             }
-            write(clipboard, Some(value), debug)?;
+            write(clipboard, value, debug)?;
             stack.pop();
         }
         StackAction::PopBoth => pop_to_both(stack, debug, try_read_both, write)?,
@@ -77,28 +91,25 @@ fn pop_to_both<FRead, FWrite>(
 ) -> Result<(), String>
 where
     FRead: FnOnce() -> Result<(Option<String>, Option<String>), String>,
-    FWrite: FnMut(CopyClipboardType, Option<String>, bool) -> Result<(), String>,
+    FWrite: FnMut(CopyClipboardType, String, bool) -> Result<(), String>,
 {
     let value = stack
         .last()
         .cloned()
         .ok_or_else(|| "clipboard stack is empty".to_string())?;
     let (original_primary, original_regular) = read()?;
+    let original_primary = original_primary.ok_or_else(|| {
+        "cannot safely pop to both when the primary clipboard has no readable text".to_string()
+    })?;
     if debug {
         eprintln!(
             "[debug] stack pop: destination=Primary+Regular, length={} chars, original_primary={} chars, original_regular={} chars",
             value.chars().count(),
-            length(original_primary.as_deref()),
+            original_primary.chars().count(),
             length(original_regular.as_deref())
         );
     }
-    write_both_with_rollback(
-        Some(value.clone()),
-        Some(value),
-        original_primary,
-        debug,
-        write,
-    )?;
+    write_both_with_rollback(value.clone(), value, original_primary, debug, write)?;
     stack.pop();
     Ok(())
 }
@@ -147,6 +158,24 @@ mod tests {
             },
         );
         assert!(result.is_err());
+        assert_eq!(stack, ["value"]);
+    }
+
+    #[test]
+    fn pop_to_both_does_not_write_without_safe_rollback_text() {
+        let mut stack = vec!["value".into()];
+        let mut writes = Vec::new();
+        let result = pop_to_both(
+            &mut stack,
+            false,
+            || Ok((None, Some("regular".into()))),
+            |clipboard, value, _| {
+                writes.push((clipboard, value));
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(writes.is_empty());
         assert_eq!(stack, ["value"]);
     }
 }
