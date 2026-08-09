@@ -269,7 +269,7 @@ impl ksni::Tray for ClipboardTray {
                 has_content(self.primary.as_deref()),
             ),
             clear_item(
-                "Clear primary clipboard",
+                "Clear primary",
                 ClearTarget::Primary,
                 has_content(self.primary.as_deref()),
             ),
@@ -286,7 +286,7 @@ impl ksni::Tray for ClipboardTray {
                 has_content(self.regular.as_deref()),
             ),
             clear_item(
-                "Clear regular clipboard",
+                "Clear regular",
                 ClearTarget::Regular,
                 has_content(self.regular.as_deref()),
             ),
@@ -1949,11 +1949,15 @@ mod tests {
             notifications_enabled: false,
         };
 
-        for (index, expected) in [(3, ClearTarget::Primary), (8, ClearTarget::Regular)] {
+        for (index, label, expected) in [
+            (3, "Clear primary", ClearTarget::Primary),
+            (8, "Clear regular", ClearTarget::Regular),
+        ] {
             let ksni::MenuItem::Standard(item) = ksni::Tray::menu(&tray).remove(index) else {
                 panic!("expected clear action menu item");
             };
             assert!(item.enabled);
+            assert_eq!(item.label, label);
             (item.activate)(&mut tray);
             assert_eq!(event_receiver.try_recv(), Ok(AppEvent::Clear(expected)));
         }
