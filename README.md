@@ -31,7 +31,7 @@ Useful options:
 ```text
 -c, --config-file <PATH>  Use a specific configuration file
 -d, --debug               Log actions to stderr without logging clipboard text
-    --with-notifications  Enable desktop notifications for this run
+    --with-notifications <MODE>  Notification mode: true, false, or all
 -h, --help                Show usage
 ```
 
@@ -58,6 +58,7 @@ update_method = "EVENTS"
 polling_period_ms = 1000
 hide_content = false
 notifications = false
+notify_on_change = false
 icon_name = "edit-paste"
 stack_size = 16
 left_click = "COPY_PRIMARY"
@@ -74,6 +75,10 @@ Mouse actions are:
 | `RESET` | Clear both clipboards |
 
 When `hide_content` is enabled, previews show only character counts. Notifications are sent after successful actions when `notifications` is enabled.
+
+Set `notify_on_change = true` to notify when the primary or regular clipboard value changes. Change notifications are disabled by default and also require notifications to be enabled. The initial clipboard snapshot does not produce a notification.
+
+`--with-notifications true` enables action notifications only, `false` disables all notifications, and `all` enables action and clipboard-change notifications. When the option is omitted, `notifications` and `notify_on_change` are read from the configuration file. The tray menu remains a runtime master toggle.
 
 `update_method` accepts `EVENTS` or `POLLING`. `EVENTS` is the default and refreshes only when Wayland reports a primary or regular selection change. If event monitoring is unavailable or disconnects, the applet falls back to `POLLING` and uses `polling_period_ms`. `POLLING` always reads both clipboards at that interval. At idle, `EVENTS` schedules no clipboard polling wakeups; `POLLING` schedules one refresh per configured period.
 

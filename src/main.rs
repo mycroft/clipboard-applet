@@ -26,9 +26,16 @@ enum CliAction {
     Run {
         config_file: Option<PathBuf>,
         debug: bool,
-        with_notifications: bool,
+        with_notifications: Option<NotificationMode>,
     },
     Help,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NotificationMode {
+    Disabled,
+    Enabled,
+    All,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -96,6 +103,13 @@ enum ClearTarget {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClipboardChange {
+    Primary,
+    Regular,
+    Both,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AppEvent {
     Action(ActionRequest),
     Stack(StackAction),
@@ -111,6 +125,7 @@ struct Config {
     polling_period_ms: u64,
     hide_content: bool,
     notifications: bool,
+    notify_on_change: bool,
     icon_name: String,
     stack_size: usize,
     left_click: ClipboardAction,
@@ -124,6 +139,7 @@ impl Default for Config {
             polling_period_ms: DEFAULT_POLLING_PERIOD_MS,
             hide_content: false,
             notifications: false,
+            notify_on_change: false,
             icon_name: "edit-paste".into(),
             stack_size: 16,
             left_click: ClipboardAction::CopyPrimary,
@@ -378,14 +394,15 @@ async fn main() {
         std::process::exit(1);
     });
     let polling_period = Duration::from_millis(config.polling_period_ms);
-    let mut notifications_enabled = config.notifications || with_notifications;
+    let (mut notifications_enabled, notify_on_change) =
+        notification_settings(&config, with_notifications);
     if debug {
         let config_name = config_file
             .as_deref()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "XDG default".into());
         eprintln!(
-            "[debug] started: config={}, update_method={}, polling_period_ms={}, icon_name={}, stack_size={}, left_click={}, middle_click={}, notifications={}",
+            "[debug] started: config={}, update_method={}, polling_period_ms={}, icon_name={}, stack_size={}, left_click={}, middle_click={}, notifications={}, notify_on_change={}",
             config_name,
             config.update_method.name(),
             config.polling_period_ms,
@@ -393,12 +410,14 @@ async fn main() {
             config.stack_size,
             config.left_click.name(),
             config.middle_click.name(),
-            notifications_enabled
+            notifications_enabled,
+            notify_on_change
         );
     }
     let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
     let (monitor_sender, mut monitor_receiver) = mpsc::channel(1);
     let mut stack = Vec::new();
+    let mut previous_clipboards = None;
 
     let tray = ClipboardTray {
         tooltip: tooltip_text(None, None, config.hide_content),
@@ -431,11 +450,15 @@ async fn main() {
         }
     };
     loop {
+        let mut check_for_change = false;
         tokio::select! {
-            _ = wait_for_poll(&mut poll_interval) => {}
+            _ = wait_for_poll(&mut poll_interval) => {
+                check_for_change = true;
+            }
             Some(event) = monitor_receiver.recv() => {
                 match event {
                     MonitorEvent::ClipboardChanged => {
+                        check_for_change = true;
                         if debug {
                             eprintln!("[debug] clipboard change event received");
                         }
@@ -523,12 +546,42 @@ async fn main() {
             }
         }
 
-        let (primary, regular) = tokio::task::spawn_blocking(read_clipboards)
-            .await
-            .unwrap_or_else(|error| {
-                eprintln!("clipboard reader stopped unexpectedly: {error}");
-                (None, None)
-            });
+        let ((primary, regular), read_succeeded) =
+            match tokio::task::spawn_blocking(try_read_clipboards).await {
+                Ok(Ok(clipboards)) => (clipboards, true),
+                Ok(Err(error)) => {
+                    eprintln!("could not read clipboards: {error}");
+                    ((None, None), false)
+                }
+                Err(error) => {
+                    eprintln!("clipboard reader stopped unexpectedly: {error}");
+                    ((None, None), false)
+                }
+            };
+        let current_clipboards = (primary.clone(), regular.clone());
+        let change = if read_succeeded {
+            previous_clipboards
+                .as_ref()
+                .and_then(|previous| clipboard_change(previous, &current_clipboards))
+        } else {
+            None
+        };
+        if read_succeeded {
+            previous_clipboards = Some(current_clipboards);
+        }
+        if check_for_change
+            && notify_on_change
+            && notifications_enabled
+            && let Some(change) = change
+        {
+            let _ =
+                tokio::task::spawn_blocking(move || send_change_notification(change, debug)).await;
+        } else if check_for_change && notify_on_change && debug {
+            eprintln!(
+                "[debug] clipboard change notification skipped: changed={}, notifications={notifications_enabled}",
+                change.is_some()
+            );
+        }
         let tooltip = tooltip_text(primary.as_deref(), regular.as_deref(), config.hide_content);
         handle
             .update(|tray| {
@@ -539,6 +592,36 @@ async fn main() {
                 tray.notifications_enabled = notifications_enabled;
             })
             .await;
+    }
+}
+
+fn clipboard_change(
+    previous: &(Option<String>, Option<String>),
+    current: &(Option<String>, Option<String>),
+) -> Option<ClipboardChange> {
+    match (previous.0 != current.0, previous.1 != current.1) {
+        (true, true) => Some(ClipboardChange::Both),
+        (true, false) => Some(ClipboardChange::Primary),
+        (false, true) => Some(ClipboardChange::Regular),
+        (false, false) => None,
+    }
+}
+
+fn send_change_notification(change: ClipboardChange, debug: bool) {
+    let body = match change {
+        ClipboardChange::Primary => "Primary clipboard changed",
+        ClipboardChange::Regular => "Regular clipboard changed",
+        ClipboardChange::Both => "Primary and regular clipboards changed",
+    };
+    if let Err(error) = notify_rust::Notification::new()
+        .summary("Clipboard applet")
+        .body(body)
+        .icon("edit-paste")
+        .show()
+    {
+        eprintln!("could not send clipboard change notification: {error}");
+    } else if debug {
+        eprintln!("[debug] clipboard change notification sent: {change:?}");
     }
 }
 
@@ -597,7 +680,7 @@ fn acquire_instance_lock(path: &Path) -> Result<File, String> {
 
 fn print_help() {
     println!(
-        "{name} {version}\n\nWayland clipboard tray applet\n\nUsage: {name} [OPTIONS]\n\nOptions:\n  -c, --config-file <PATH>  Use this configuration file\n  -d, --debug               Log clipboard actions to stderr\n      --with-notifications  Enable desktop notifications\n  -h, --help                Show this help",
+        "{name} {version}\n\nWayland clipboard tray applet\n\nUsage: {name} [OPTIONS]\n\nOptions:\n  -c, --config-file <PATH>            Use this configuration file\n  -d, --debug                         Log clipboard actions to stderr\n      --with-notifications <MODE>     Notification mode: true, false, or all\n  -h, --help                          Show this help",
         name = env!("CARGO_PKG_NAME"),
         version = env!("CARGO_PKG_VERSION")
     );
@@ -607,7 +690,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction, Str
     let mut args = args.into_iter();
     let mut config_file = None;
     let mut debug = false;
-    let mut with_notifications = false;
+    let mut with_notifications = None;
     while let Some(argument) = args.next() {
         let value = match argument.to_str() {
             Some("-h" | "--help") => return Ok(CliAction::Help),
@@ -616,7 +699,28 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction, Str
                 continue;
             }
             Some("--with-notifications") => {
-                with_notifications = true;
+                let value = args.next().ok_or_else(|| {
+                    "--with-notifications requires true, false, or all".to_string()
+                })?;
+                let value = value.to_str().ok_or_else(|| {
+                    "--with-notifications requires true, false, or all".to_string()
+                })?;
+                if with_notifications
+                    .replace(parse_notification_mode(value)?)
+                    .is_some()
+                {
+                    return Err("--with-notifications specified more than once".into());
+                }
+                continue;
+            }
+            Some(argument) if argument.starts_with("--with-notifications=") => {
+                let value = &argument["--with-notifications=".len()..];
+                if with_notifications
+                    .replace(parse_notification_mode(value)?)
+                    .is_some()
+                {
+                    return Err("--with-notifications specified more than once".into());
+                }
                 continue;
             }
             Some("-c" | "--config-file") => PathBuf::from(
@@ -641,6 +745,26 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction, Str
         debug,
         with_notifications,
     })
+}
+
+fn parse_notification_mode(value: &str) -> Result<NotificationMode, String> {
+    match value {
+        "true" => Ok(NotificationMode::Enabled),
+        "false" => Ok(NotificationMode::Disabled),
+        "all" => Ok(NotificationMode::All),
+        _ => Err(format!(
+            "invalid --with-notifications value {value:?}; expected true, false, or all"
+        )),
+    }
+}
+
+fn notification_settings(config: &Config, override_mode: Option<NotificationMode>) -> (bool, bool) {
+    match override_mode {
+        None => (config.notifications, config.notify_on_change),
+        Some(NotificationMode::Disabled) => (false, false),
+        Some(NotificationMode::Enabled) => (true, false),
+        Some(NotificationMode::All) => (true, true),
+    }
 }
 
 fn load_config(config_file: Option<&Path>) -> Result<Config, String> {
@@ -699,20 +823,17 @@ fn parse_config(contents: &str, path: &Path) -> Result<Config, String> {
 }
 
 fn read_clipboards() -> (Option<String>, Option<String>) {
-    (
-        read_clipboard(ClipboardType::Primary),
-        read_clipboard(ClipboardType::Regular),
-    )
+    try_read_clipboards().unwrap_or_else(|error| {
+        eprintln!("could not read clipboards: {error}");
+        (None, None)
+    })
 }
 
-fn read_clipboard(clipboard: ClipboardType) -> Option<String> {
-    match try_read_clipboard(clipboard) {
-        Ok(value) => value,
-        Err(error) => {
-            eprintln!("could not read clipboard: {error}");
-            None
-        }
-    }
+fn try_read_clipboards() -> Result<(Option<String>, Option<String>), String> {
+    Ok((
+        try_read_clipboard(ClipboardType::Primary)?,
+        try_read_clipboard(ClipboardType::Regular)?,
+    ))
 }
 
 fn try_read_clipboard(clipboard: ClipboardType) -> Result<Option<String>, String> {
@@ -1027,7 +1148,7 @@ mod tests {
             Ok(CliAction::Run {
                 config_file: Some(PathBuf::from("custom.toml")),
                 debug: false,
-                with_notifications: false,
+                with_notifications: None,
             })
         );
     }
@@ -1039,7 +1160,7 @@ mod tests {
             Ok(CliAction::Run {
                 config_file: Some(PathBuf::from("custom.toml")),
                 debug: false,
-                with_notifications: false,
+                with_notifications: None,
             })
         );
         assert_eq!(
@@ -1050,7 +1171,7 @@ mod tests {
             Ok(CliAction::Run {
                 config_file: Some(PathBuf::from("custom.toml")),
                 debug: false,
-                with_notifications: false,
+                with_notifications: None,
             })
         );
     }
@@ -1068,7 +1189,7 @@ mod tests {
             Ok(CliAction::Run {
                 config_file: None,
                 debug: true,
-                with_notifications: false,
+                with_notifications: None,
             })
         );
         assert_eq!(
@@ -1076,7 +1197,7 @@ mod tests {
             Ok(CliAction::Run {
                 config_file: None,
                 debug: true,
-                with_notifications: false,
+                with_notifications: None,
             })
         );
     }
@@ -1084,12 +1205,69 @@ mod tests {
     #[test]
     fn notifications_option_is_parsed() {
         assert_eq!(
-            parse_args([OsString::from("--with-notifications")]),
+            parse_args([
+                OsString::from("--with-notifications"),
+                OsString::from("true")
+            ]),
             Ok(CliAction::Run {
                 config_file: None,
                 debug: false,
-                with_notifications: true,
+                with_notifications: Some(NotificationMode::Enabled),
             })
+        );
+        assert_eq!(
+            parse_args([OsString::from("--with-notifications=false")]),
+            Ok(CliAction::Run {
+                config_file: None,
+                debug: false,
+                with_notifications: Some(NotificationMode::Disabled),
+            })
+        );
+        assert_eq!(
+            parse_args([OsString::from("--with-notifications=all")]),
+            Ok(CliAction::Run {
+                config_file: None,
+                debug: false,
+                with_notifications: Some(NotificationMode::All),
+            })
+        );
+    }
+
+    #[test]
+    fn notifications_option_rejects_missing_invalid_and_duplicate_values() {
+        assert!(parse_args([OsString::from("--with-notifications")]).is_err());
+        assert!(parse_args([OsString::from("--with-notifications=maybe")]).is_err());
+        assert!(
+            parse_args([
+                OsString::from("--with-notifications=true"),
+                OsString::from("--with-notifications=all")
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn notification_cli_mode_overrides_configuration() {
+        let mut config = Config {
+            notifications: true,
+            notify_on_change: true,
+            ..Config::default()
+        };
+        assert_eq!(notification_settings(&config, None), (true, true));
+        assert_eq!(
+            notification_settings(&config, Some(NotificationMode::Disabled)),
+            (false, false)
+        );
+        assert_eq!(
+            notification_settings(&config, Some(NotificationMode::Enabled)),
+            (true, false)
+        );
+
+        config.notifications = false;
+        config.notify_on_change = false;
+        assert_eq!(
+            notification_settings(&config, Some(NotificationMode::All)),
+            (true, true)
         );
     }
 
@@ -1133,6 +1311,7 @@ mod tests {
         assert_eq!(config.update_method, UpdateMethod::Events);
         assert!(!config.hide_content);
         assert!(!config.notifications);
+        assert!(!config.notify_on_change);
         assert_eq!(config.icon_name, "edit-paste");
         assert_eq!(config.stack_size, 16);
         assert_eq!(config.left_click, ClipboardAction::CopyPrimary);
@@ -1167,6 +1346,30 @@ mod tests {
         )
         .unwrap();
         assert!(config.notifications);
+    }
+
+    #[test]
+    fn config_parses_change_notification_setting() {
+        let config = parse_config("notify_on_change = true", Path::new("config.toml")).unwrap();
+        assert!(config.notify_on_change);
+    }
+
+    #[test]
+    fn clipboard_change_identifies_changed_selections() {
+        let original = (Some("primary".into()), Some("regular".into()));
+        assert_eq!(clipboard_change(&original, &original), None);
+        assert_eq!(
+            clipboard_change(&(None, original.1.clone()), &original),
+            Some(ClipboardChange::Primary)
+        );
+        assert_eq!(
+            clipboard_change(&(original.0.clone(), None), &original),
+            Some(ClipboardChange::Regular)
+        );
+        assert_eq!(
+            clipboard_change(&(None, None), &original),
+            Some(ClipboardChange::Both)
+        );
     }
 
     #[test]

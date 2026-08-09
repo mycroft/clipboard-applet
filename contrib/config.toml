@@ -18,6 +18,10 @@ hide_content = false
 # Send a desktop notification after a successful clipboard action.
 notifications = false
 
+# Send a notification when a clipboard value changes. This also requires
+# notifications to be enabled. --with-notifications all overrides both values.
+notify_on_change = false
+
 # Freedesktop icon-theme name used for the tray icon.
 icon_name = "edit-paste"
 
