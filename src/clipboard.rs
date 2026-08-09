@@ -58,6 +58,12 @@ pub(crate) enum ClipboardRead {
     Error(String),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SwitchValue {
+    Text(String),
+    Empty,
+}
+
 impl ClipboardRead {
     pub(crate) fn state(&self) -> &'static str {
         match self {
@@ -81,6 +87,19 @@ impl ClipboardRead {
         match self {
             Self::Text(value) => Ok(value),
             Self::Empty => Err(format!("{source} clipboard is empty")),
+            Self::NonText => Err(format!("{source} clipboard does not contain text")),
+            Self::Unsupported => Err(format!("{source} clipboard is unsupported")),
+            Self::Oversized { limit } => Err(format!(
+                "{source} clipboard exceeds the configured {limit}-byte limit"
+            )),
+            Self::Error(error) => Err(format!("could not read {source} clipboard: {error}")),
+        }
+    }
+
+    fn into_switch_value(self, source: &str) -> Result<SwitchValue, String> {
+        match self {
+            Self::Text(value) => Ok(SwitchValue::Text(value)),
+            Self::Empty => Ok(SwitchValue::Empty),
             Self::NonText => Err(format!("{source} clipboard does not contain text")),
             Self::Unsupported => Err(format!("{source} clipboard is unsupported")),
             Self::Oversized { limit } => Err(format!(
@@ -161,6 +180,7 @@ pub(crate) fn perform_action(
         debug,
         |clipboard| read(clipboard, max_bytes),
         write,
+        write_switch_value,
         || clear(CopyClipboardType::Both, CopySeat::All).map_err(|error| error.to_string()),
     )?;
     let notification_sent =
@@ -173,16 +193,18 @@ pub(crate) fn perform_action(
     Ok(())
 }
 
-fn apply_action<FRead, FWrite, FClear>(
+fn apply_action<FRead, FWrite, FSwitchWrite, FClear>(
     action: ClipboardAction,
     debug: bool,
     mut read: FRead,
     mut write: FWrite,
+    mut switch_write: FSwitchWrite,
     mut clear_both: FClear,
 ) -> Result<(), String>
 where
     FRead: FnMut(ClipboardType) -> ClipboardRead,
     FWrite: FnMut(CopyClipboardType, String, bool) -> Result<(), String>,
+    FSwitchWrite: FnMut(CopyClipboardType, SwitchValue, bool) -> Result<(), String>,
     FClear: FnMut() -> Result<(), String>,
 {
     match action {
@@ -216,7 +238,7 @@ where
             read(ClipboardType::Primary),
             read(ClipboardType::Regular),
             debug,
-            &mut write,
+            &mut switch_write,
         )?,
     }
     Ok(())
@@ -273,7 +295,7 @@ fn switch_reads<F>(
     write: F,
 ) -> Result<(), String>
 where
-    F: FnMut(CopyClipboardType, String, bool) -> Result<(), String>,
+    F: FnMut(CopyClipboardType, SwitchValue, bool) -> Result<(), String>,
 {
     if debug {
         eprintln!(
@@ -284,9 +306,28 @@ where
             regular.text_length()
         );
     }
-    let primary = primary.into_text("primary")?;
-    let regular = regular.into_text("regular")?;
+    let primary = primary.into_switch_value("primary")?;
+    let regular = regular.into_switch_value("regular")?;
+    if primary == SwitchValue::Empty && regular == SwitchValue::Empty {
+        return Ok(());
+    }
     write_both_with_rollback(regular, primary.clone(), primary, debug, write)
+}
+
+fn write_switch_value(
+    clipboard: CopyClipboardType,
+    value: SwitchValue,
+    debug: bool,
+) -> Result<(), String> {
+    match value {
+        SwitchValue::Text(value) => write(clipboard, value, debug),
+        SwitchValue::Empty => {
+            if debug {
+                eprintln!("[debug] clearing switch destination: {clipboard:?}");
+            }
+            clear(clipboard, CopySeat::All).map_err(|error| error.to_string())
+        }
+    }
 }
 
 fn action_notification(action: ClipboardAction) -> &'static str {
@@ -302,15 +343,15 @@ pub(crate) fn length(value: Option<&str>) -> usize {
     value.map_or(0, |value| value.chars().count())
 }
 
-pub(crate) fn write_both_with_rollback<F>(
-    primary: String,
-    regular: String,
-    original_primary: String,
+pub(crate) fn write_both_with_rollback<T, F>(
+    primary: T,
+    regular: T,
+    original_primary: T,
     debug: bool,
     mut write: F,
 ) -> Result<(), String>
 where
-    F: FnMut(CopyClipboardType, String, bool) -> Result<(), String>,
+    F: FnMut(CopyClipboardType, T, bool) -> Result<(), String>,
 {
     if let Err(error) = write(CopyClipboardType::Primary, primary, debug) {
         if debug {
@@ -378,6 +419,15 @@ mod tests {
         ]
     }
 
+    fn unsafe_switch_states() -> Vec<ClipboardRead> {
+        vec![
+            ClipboardRead::NonText,
+            ClipboardRead::Unsupported,
+            ClipboardRead::Oversized { limit: 10 },
+            ClipboardRead::Error("read failed".into()),
+        ]
+    }
+
     #[test]
     fn counts_unicode_characters() {
         assert_eq!(length(Some("é🙂")), 2);
@@ -392,7 +442,7 @@ mod tests {
             "new-r".into(),
             "old-p".into(),
             false,
-            |clipboard, value, _| {
+            |clipboard, value: String, _| {
                 writes.push((clipboard, value));
                 if writes.len() == 2 {
                     Err("boom".into())
@@ -456,28 +506,61 @@ mod tests {
     }
 
     #[test]
-    fn switch_writes_only_when_both_reads_are_text() {
+    fn switch_exchanges_text_and_empty_states() {
         let mut writes = Vec::new();
-        switch_reads(
-            ClipboardRead::Text("primary".into()),
-            ClipboardRead::Text("regular".into()),
-            false,
-            |clipboard, value, _| {
+        for (primary, regular, expected) in [
+            (
+                ClipboardRead::Text("primary".into()),
+                ClipboardRead::Text("regular".into()),
+                vec![
+                    (
+                        CopyClipboardType::Primary,
+                        SwitchValue::Text("regular".into()),
+                    ),
+                    (
+                        CopyClipboardType::Regular,
+                        SwitchValue::Text("primary".into()),
+                    ),
+                ],
+            ),
+            (
+                ClipboardRead::Text("primary".into()),
+                ClipboardRead::Empty,
+                vec![
+                    (CopyClipboardType::Primary, SwitchValue::Empty),
+                    (
+                        CopyClipboardType::Regular,
+                        SwitchValue::Text("primary".into()),
+                    ),
+                ],
+            ),
+            (
+                ClipboardRead::Empty,
+                ClipboardRead::Text("regular".into()),
+                vec![
+                    (
+                        CopyClipboardType::Primary,
+                        SwitchValue::Text("regular".into()),
+                    ),
+                    (CopyClipboardType::Regular, SwitchValue::Empty),
+                ],
+            ),
+            (ClipboardRead::Empty, ClipboardRead::Empty, vec![]),
+        ] {
+            writes.clear();
+            switch_reads(primary, regular, false, |clipboard, value, _| {
                 writes.push((clipboard, value));
                 Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            writes,
-            [
-                (CopyClipboardType::Primary, "regular".into()),
-                (CopyClipboardType::Regular, "primary".into()),
-            ]
-        );
+            })
+            .unwrap();
+            assert_eq!(writes, expected);
+        }
+    }
 
-        for state in unreadable_states() {
-            writes.clear();
+    #[test]
+    fn switch_does_not_mutate_unreadable_clipboards() {
+        let mut writes = Vec::new();
+        for state in unsafe_switch_states() {
             assert!(
                 switch_reads(
                     state.clone(),
@@ -509,6 +592,26 @@ mod tests {
     }
 
     #[test]
+    fn switch_restores_an_empty_primary_when_regular_clear_fails() {
+        let mut writes = Vec::new();
+        let result = switch_reads(
+            ClipboardRead::Empty,
+            ClipboardRead::Text("regular".into()),
+            false,
+            |clipboard, value, _| {
+                writes.push((clipboard, value));
+                if writes.len() == 2 {
+                    Err("boom".into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(result.unwrap_err().contains("primary clipboard restored"));
+        assert_eq!(writes[2], (CopyClipboardType::Primary, SwitchValue::Empty));
+    }
+
+    #[test]
     fn actions_read_write_and_clear_the_expected_selections() {
         for (action, expected_source, expected_destination) in [
             (
@@ -535,6 +638,7 @@ mod tests {
                     writes.push((clipboard, value));
                     Ok(())
                 },
+                |_, _, _| panic!("copy must not use the switch writer"),
                 || panic!("copy must not clear clipboards"),
             )
             .unwrap();
@@ -550,6 +654,7 @@ mod tests {
                 ClipboardType::Primary => ClipboardRead::Text("primary".into()),
                 ClipboardType::Regular => ClipboardRead::Text("regular".into()),
             },
+            |_, _, _| panic!("switch must not use the text writer"),
             |clipboard, value, _| {
                 writes.push((clipboard, value));
                 Ok(())
@@ -565,6 +670,7 @@ mod tests {
             false,
             |_| panic!("reset must not read clipboards"),
             |_, _, _| panic!("reset must not use the text writer"),
+            |_, _, _| panic!("reset must not use the switch writer"),
             || {
                 clears += 1;
                 Ok(())
