@@ -3,8 +3,12 @@
 # Install as $XDG_CONFIG_HOME/clipboard-applet/config.toml, or as
 # ~/.config/clipboard-applet/config.toml when XDG_CONFIG_HOME is unset.
 
-# How often to refresh the clipboard previews, in milliseconds.
-# Must be greater than zero.
+# Clipboard refresh method: EVENTS or POLLING. EVENTS falls back to POLLING if
+# change monitoring is unavailable or stops.
+update_method = "EVENTS"
+
+# How often to refresh when using POLLING or after event fallback, in
+# milliseconds. Must be greater than zero.
 polling_period_ms = 1000
 
 # Hide clipboard text in the tooltip and right-click menu. When enabled,

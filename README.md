@@ -4,7 +4,7 @@ A small Rust tray applet for viewing and manipulating Wayland primary and regula
 
 ## Features
 
-- Polls and previews both text clipboards in the tray tooltip.
+- Monitors clipboard changes using Wayland events, with configurable polling fallback.
 - Copies, switches, and clears either or both clipboards.
 - Configurable left- and middle-click actions.
 - Right-click menu with state-aware clipboard and notification actions.
@@ -54,6 +54,7 @@ cp contrib/config.toml "${XDG_CONFIG_HOME:-$HOME/.config}/clipboard-applet/confi
 Default configuration:
 
 ```toml
+update_method = "EVENTS"
 polling_period_ms = 1000
 hide_content = false
 notifications = false
@@ -73,6 +74,8 @@ Mouse actions are:
 | `RESET` | Clear both clipboards |
 
 When `hide_content` is enabled, previews show only character counts. Notifications are sent after successful actions when `notifications` is enabled.
+
+`update_method` accepts `EVENTS` or `POLLING`. `EVENTS` is the default and refreshes only when Wayland reports a primary or regular selection change. If event monitoring is unavailable or disconnects, the applet falls back to `POLLING` and uses `polling_period_ms`. `POLLING` always reads both clipboards at that interval. At idle, `EVENTS` schedules no clipboard polling wakeups; `POLLING` schedules one refresh per configured period.
 
 `icon_name` is a Freedesktop icon-theme name resolved by the desktop, not a Unicode character or image path.
 

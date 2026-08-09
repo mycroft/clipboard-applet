@@ -1,3 +1,5 @@
+mod clipboard_monitor;
+
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -13,6 +15,8 @@ use wl_clipboard_rs::copy::{
     Source, clear,
 };
 use wl_clipboard_rs::paste::{ClipboardType, Error, MimeType, Seat, get_contents};
+
+use clipboard_monitor::MonitorEvent;
 
 const PREVIEW_CHARS: usize = 40;
 const DEFAULT_POLLING_PERIOD_MS: u64 = 1_000;
@@ -43,6 +47,22 @@ impl ClipboardAction {
             Self::CopyPrimary => "COPY_PRIMARY",
             Self::Reset => "RESET",
             Self::Switch => "SWITCH",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum UpdateMethod {
+    Events,
+    Polling,
+}
+
+impl UpdateMethod {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Events => "EVENTS",
+            Self::Polling => "POLLING",
         }
     }
 }
@@ -87,6 +107,7 @@ enum AppEvent {
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct Config {
+    update_method: UpdateMethod,
     polling_period_ms: u64,
     hide_content: bool,
     notifications: bool,
@@ -99,6 +120,7 @@ struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            update_method: UpdateMethod::Events,
             polling_period_ms: DEFAULT_POLLING_PERIOD_MS,
             hide_content: false,
             notifications: false,
@@ -363,8 +385,9 @@ async fn main() {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "XDG default".into());
         eprintln!(
-            "[debug] started: config={}, polling_period_ms={}, icon_name={}, stack_size={}, left_click={}, middle_click={}, notifications={}",
+            "[debug] started: config={}, update_method={}, polling_period_ms={}, icon_name={}, stack_size={}, left_click={}, middle_click={}, notifications={}",
             config_name,
+            config.update_method.name(),
             config.polling_period_ms,
             config.icon_name,
             config.stack_size,
@@ -374,6 +397,7 @@ async fn main() {
         );
     }
     let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+    let (monitor_sender, mut monitor_receiver) = mpsc::channel(1);
     let mut stack = Vec::new();
 
     let tray = ClipboardTray {
@@ -393,11 +417,37 @@ async fn main() {
         std::process::exit(1);
     });
 
-    let mut poll_interval = tokio::time::interval(polling_period);
-    poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut poll_interval = match config.update_method {
+        UpdateMethod::Events => match clipboard_monitor::spawn(monitor_sender) {
+            Ok(()) => None,
+            Err(error) => {
+                eprintln!("{error}; falling back to polling");
+                Some(new_poll_interval(polling_period))
+            }
+        },
+        UpdateMethod::Polling => {
+            drop(monitor_sender);
+            Some(new_poll_interval(polling_period))
+        }
+    };
     loop {
         tokio::select! {
-            _ = poll_interval.tick() => {}
+            _ = wait_for_poll(&mut poll_interval) => {}
+            Some(event) = monitor_receiver.recv() => {
+                match event {
+                    MonitorEvent::ClipboardChanged => {
+                        if debug {
+                            eprintln!("[debug] clipboard change event received");
+                        }
+                    }
+                    MonitorEvent::Failed => {
+                        if debug {
+                            eprintln!("[debug] clipboard update method changed: EVENTS -> POLLING");
+                        }
+                        poll_interval = Some(new_poll_interval(polling_period));
+                    }
+                }
+            }
             Some(event) = event_receiver.recv() => {
                 match event {
                     AppEvent::Exit => {
@@ -489,6 +539,21 @@ async fn main() {
                 tray.notifications_enabled = notifications_enabled;
             })
             .await;
+    }
+}
+
+fn new_poll_interval(period: Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
+}
+
+async fn wait_for_poll(interval: &mut Option<tokio::time::Interval>) {
+    match interval {
+        Some(interval) => {
+            interval.tick().await;
+        }
+        None => std::future::pending().await,
     }
 }
 
@@ -1065,12 +1130,23 @@ mod tests {
     fn config_parses_polling_period() {
         let config = parse_config("polling_period_ms = 250", Path::new("config.toml")).unwrap();
         assert_eq!(config.polling_period_ms, 250);
+        assert_eq!(config.update_method, UpdateMethod::Events);
         assert!(!config.hide_content);
         assert!(!config.notifications);
         assert_eq!(config.icon_name, "edit-paste");
         assert_eq!(config.stack_size, 16);
         assert_eq!(config.left_click, ClipboardAction::CopyPrimary);
         assert_eq!(config.middle_click, ClipboardAction::Switch);
+    }
+
+    #[test]
+    fn config_parses_update_methods() {
+        let events = parse_config("update_method = \"EVENTS\"", Path::new("config.toml")).unwrap();
+        assert_eq!(events.update_method, UpdateMethod::Events);
+
+        let polling =
+            parse_config("update_method = \"POLLING\"", Path::new("config.toml")).unwrap();
+        assert_eq!(polling.update_method, UpdateMethod::Polling);
     }
 
     #[test]
