@@ -94,6 +94,7 @@ notifications = false
 notify_on_change = false
 icon_name = "edit-paste"
 editor = []
+stack_enabled = true
 stack_size = 16
 left_click = "COPY_PRIMARY"
 middle_click = "SWITCH"
@@ -126,7 +127,7 @@ editor = ["foot", "-e", "nvim"]
 
 Edited files larger than 1 MiB are rejected, and the original value is preserved when the editor fails or produces invalid UTF-8.
 
-`stack_size` limits the shared in-memory clipboard stack to between 1 and 16 text entries. The stack is cleared when the applet exits.
+`stack_enabled = false` removes all stack actions and entries from the tray menu. `stack_size` limits the enabled shared in-memory clipboard stack to between 1 and 16 text entries. The stack is cleared when the applet exits.
 
 Only one applet instance can run in a desktop session. A second process exits with an explanatory error. The advisory lock is released automatically when the running process exits or crashes, so a leftover lock file does not block future starts.
 

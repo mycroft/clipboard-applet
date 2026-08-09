@@ -36,6 +36,7 @@ pub(crate) struct ClipboardTray {
     pub(crate) hide_content: bool,
     pub(crate) notifications_enabled: bool,
     pub(crate) editor_enabled: bool,
+    pub(crate) stack_enabled: bool,
 }
 
 impl ksni::Tray for ClipboardTray {
@@ -142,17 +143,19 @@ impl ksni::Tray for ClipboardTray {
                 has_content(self.primary.as_deref()),
             ));
         }
-        menu.extend([
-            action_item(
-                "Copy primary to regular",
-                ClipboardAction::CopyPrimary,
-                has_content(self.primary.as_deref()),
-            ),
-            stack_item(
+        menu.push(action_item(
+            "Copy primary to regular",
+            ClipboardAction::CopyPrimary,
+            has_content(self.primary.as_deref()),
+        ));
+        if self.stack_enabled {
+            menu.push(stack_item(
                 "Stack primary",
                 StackAction::PushPrimary,
                 has_content(self.primary.as_deref()),
-            ),
+            ));
+        }
+        menu.extend([
             clear_item(
                 "Clear primary",
                 ClearTarget::Primary,
@@ -168,17 +171,19 @@ impl ksni::Tray for ClipboardTray {
                 has_content(self.regular.as_deref()),
             ));
         }
-        menu.extend([
-            action_item(
-                "Copy regular to primary",
-                ClipboardAction::CopyRegular,
-                has_content(self.regular.as_deref()),
-            ),
-            stack_item(
+        menu.push(action_item(
+            "Copy regular to primary",
+            ClipboardAction::CopyRegular,
+            has_content(self.regular.as_deref()),
+        ));
+        if self.stack_enabled {
+            menu.push(stack_item(
                 "Stack regular",
                 StackAction::PushRegular,
                 has_content(self.regular.as_deref()),
-            ),
+            ));
+        }
+        menu.extend([
             clear_item(
                 "Clear regular",
                 ClearTarget::Regular,
@@ -187,25 +192,22 @@ impl ksni::Tray for ClipboardTray {
             separator_item(),
             action_item("Switch clipboards", ClipboardAction::Switch, any_content),
             action_item("Reset clipboards", ClipboardAction::Reset, any_content),
-            separator_item(),
         ]);
-        if self.stack.is_empty() {
-            menu.push(
-                StandardItem {
-                    label: "No stacked entries yet".into(),
-                    enabled: false,
-                    ..Default::default()
-                }
-                .into(),
-            );
-        } else {
-            if self.editor_enabled {
-                menu.extend(
-                    self.stack
-                        .iter()
-                        .rev()
-                        .enumerate()
-                        .map(|(display_index, value)| {
+        if self.stack_enabled {
+            menu.push(separator_item());
+            if self.stack.is_empty() {
+                menu.push(
+                    StandardItem {
+                        label: "No stacked entries yet".into(),
+                        enabled: false,
+                        ..Default::default()
+                    }
+                    .into(),
+                );
+            } else {
+                if self.editor_enabled {
+                    menu.extend(self.stack.iter().rev().enumerate().map(
+                        |(display_index, value)| {
                             let stack_index = self.stack.len() - 1 - display_index;
                             let label = if self.hide_content {
                                 format!("Edit stacked entry {}", display_index + 1)
@@ -218,24 +220,25 @@ impl ksni::Tray for ClipboardTray {
                                 .replace('_', "__")
                             };
                             edit_item(label, EditTarget::Stack(stack_index), true)
-                        }),
-                );
-            } else if !self.hide_content {
-                menu.extend(self.stack.iter().rev().enumerate().map(|(index, value)| {
-                    StandardItem {
-                        label: format!("{}: {}", index + 1, preview(Some(value), false))
-                            .replace('_', "__"),
-                        enabled: false,
-                        ..Default::default()
-                    }
-                    .into()
-                }));
+                        },
+                    ));
+                } else if !self.hide_content {
+                    menu.extend(self.stack.iter().rev().enumerate().map(|(index, value)| {
+                        StandardItem {
+                            label: format!("{}: {}", index + 1, preview(Some(value), false))
+                                .replace('_', "__"),
+                            enabled: false,
+                            ..Default::default()
+                        }
+                        .into()
+                    }));
+                }
+                menu.extend([
+                    stack_item("Pop to primary", StackAction::PopPrimary, true),
+                    stack_item("Pop to regular", StackAction::PopRegular, true),
+                    stack_item("Pop to primary and regular", StackAction::PopBoth, true),
+                ]);
             }
-            menu.extend([
-                stack_item("Pop to primary", StackAction::PopPrimary, true),
-                stack_item("Pop to regular", StackAction::PopRegular, true),
-                stack_item("Pop to primary and regular", StackAction::PopBoth, true),
-            ]);
         }
         menu.extend([
             separator_item(),
@@ -321,6 +324,7 @@ mod tests {
                 hide_content: false,
                 notifications_enabled: false,
                 editor_enabled: true,
+                stack_enabled: true,
             },
             event_receiver,
         )
@@ -390,5 +394,22 @@ mod tests {
         assert!(labels.iter().all(|label| !label.starts_with("Edit")));
         assert!(labels.iter().any(|label| label == "1: newest"));
         assert!(labels.iter().any(|label| label == "2: oldest"));
+    }
+
+    #[test]
+    fn stack_menu_items_are_hidden_when_stack_is_disabled() {
+        let (mut tray, _) = editable_tray();
+        tray.stack_enabled = false;
+        let labels: Vec<String> = ksni::Tray::menu(&tray)
+            .into_iter()
+            .filter_map(|item| match item {
+                ksni::MenuItem::Standard(item) => Some(item.label),
+                _ => None,
+            })
+            .collect();
+        assert!(labels.iter().all(|label| !label.starts_with("Stack ")));
+        assert!(labels.iter().all(|label| !label.starts_with("Pop to ")));
+        assert!(labels.iter().all(|label| !label.starts_with("Edit 1:")));
+        assert!(!labels.iter().any(|label| label == "No stacked entries yet"));
     }
 }

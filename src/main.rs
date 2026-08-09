@@ -99,6 +99,7 @@ async fn main() {
         hide_content: config.hide_content,
         notifications_enabled,
         editor_enabled: !config.editor.is_empty(),
+        stack_enabled: config.stack_enabled,
     };
     let handle = tray.spawn().await.unwrap_or_else(|error| {
         eprintln!("failed to register tray icon: {error}");

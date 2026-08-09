@@ -32,6 +32,7 @@ pub(crate) struct Config {
     pub(crate) notify_on_change: bool,
     pub(crate) icon_name: String,
     pub(crate) editor: Vec<String>,
+    pub(crate) stack_enabled: bool,
     pub(crate) stack_size: usize,
     pub(crate) left_click: ClipboardAction,
     pub(crate) middle_click: ClipboardAction,
@@ -47,6 +48,7 @@ impl Default for Config {
             notify_on_change: false,
             icon_name: "edit-paste".into(),
             editor: Vec::new(),
+            stack_enabled: true,
             stack_size: 16,
             left_click: ClipboardAction::CopyPrimary,
             middle_click: ClipboardAction::Switch,
@@ -144,6 +146,7 @@ mod tests {
         assert_eq!(config.update_method, UpdateMethod::Events);
         assert_eq!(config.left_click, ClipboardAction::CopyPrimary);
         assert_eq!(config.stack_size, 16);
+        assert!(config.stack_enabled);
         assert!(config.editor.is_empty());
     }
 
@@ -177,5 +180,11 @@ mod tests {
         let config = parse("editor = ['foot', '-e', 'nvim']", Path::new("config.toml")).unwrap();
         assert_eq!(config.editor, ["foot", "-e", "nvim"]);
         assert!(parse("editor = ['  ']", Path::new("config.toml")).is_err());
+    }
+
+    #[test]
+    fn parses_disabled_stack() {
+        let config = parse("stack_enabled = false", Path::new("config.toml")).unwrap();
+        assert!(!config.stack_enabled);
     }
 }

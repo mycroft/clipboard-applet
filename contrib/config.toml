@@ -31,6 +31,9 @@ icon_name = "edit-paste"
 # Example: ["foot", "-e", "nvim"]
 editor = []
 
+# Enable the in-memory clipboard stack and all related tray menu entries.
+stack_enabled = true
+
 # Maximum number of clipboard texts retained in the in-memory LIFO stack (1-16).
 stack_size = 16
 
