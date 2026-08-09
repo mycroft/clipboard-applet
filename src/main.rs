@@ -1,5 +1,7 @@
 use std::ffi::OsString;
-use std::io::Read;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -337,6 +339,18 @@ async fn main() {
         print_help();
         return;
     };
+    let lock_path =
+        instance_lock_path(std::env::var_os("XDG_RUNTIME_DIR")).unwrap_or_else(|error| {
+            eprintln!("failed to establish single-instance lock: {error}");
+            std::process::exit(1);
+        });
+    let _instance_lock = acquire_instance_lock(&lock_path).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(1);
+    });
+    if debug {
+        eprintln!("[debug] acquired instance lock: {}", lock_path.display());
+    }
     let config = load_config(config_file.as_deref()).unwrap_or_else(|error| {
         eprintln!("failed to load configuration: {error}");
         std::process::exit(1);
@@ -476,6 +490,44 @@ async fn main() {
             })
             .await;
     }
+}
+
+fn instance_lock_path(runtime_dir: Option<OsString>) -> Result<PathBuf, String> {
+    let runtime_dir = runtime_dir
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| "XDG_RUNTIME_DIR is not set".to_string())?;
+    Ok(PathBuf::from(runtime_dir).join("clipboard-applet.lock"))
+}
+
+fn acquire_instance_lock(path: &Path) -> Result<File, String> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("failed to open instance lock {}: {error}", path.display()))?;
+
+    // SAFETY: `file` owns a valid descriptor for this call, and `flock` does
+    // not retain the descriptor or dereference a Rust pointer.
+    let lock_result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if lock_result == -1 {
+        let error = std::io::Error::last_os_error();
+        return Err(if error.kind() == std::io::ErrorKind::WouldBlock {
+            format!(
+                "{} is already running for this session (lock: {})",
+                env!("CARGO_PKG_NAME"),
+                path.display()
+            )
+        } else {
+            format!("failed to lock {}: {error}", path.display())
+        });
+    }
+
+    file.set_len(0)
+        .and_then(|()| writeln!(file, "{}", std::process::id()))
+        .map_err(|error| format!("failed to write instance lock {}: {error}", path.display()))?;
+    Ok(file)
 }
 
 fn print_help() {
@@ -870,6 +922,38 @@ fn preview(value: Option<&str>, hide_content: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn unique_test_path(name: &str) -> PathBuf {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "clipboard-applet-{name}-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn instance_lock_path_uses_xdg_runtime_directory() {
+        assert_eq!(
+            instance_lock_path(Some(OsString::from("/run/user/1000"))),
+            Ok(PathBuf::from("/run/user/1000/clipboard-applet.lock"))
+        );
+        assert!(instance_lock_path(None).is_err());
+    }
+
+    #[test]
+    fn instance_lock_rejects_contention_and_can_be_reacquired() {
+        let path = unique_test_path("instance-lock");
+        let first = acquire_instance_lock(&path).unwrap();
+        let error = acquire_instance_lock(&path).unwrap_err();
+        assert!(error.contains("already running"));
+
+        drop(first);
+        let second = acquire_instance_lock(&path).unwrap();
+        drop(second);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn config_file_short_option_is_parsed() {

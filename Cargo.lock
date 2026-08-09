@@ -206,6 +206,7 @@ name = "clipboard-applet"
 version = "0.1.0"
 dependencies = [
  "ksni",
+ "libc",
  "notify-rust",
  "serde",
  "tokio",

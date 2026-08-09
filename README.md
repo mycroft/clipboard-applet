@@ -10,12 +10,14 @@ A small Rust tray applet for viewing and manipulating Wayland primary and regula
 - Right-click menu with state-aware clipboard and notification actions.
 - Shared in-memory LIFO stack with push and pop-to-one-or-both operations.
 - Optional content hiding, notifications, and debug logging.
+- Single-instance protection for each desktop session.
 
 ## Requirements
 
 - Rust 1.85 or newer (edition 2024)
 - A Wayland compositor supporting `ext-data-control` or `wlr-data-control`; primary selection requires the appropriate primary-selection support
 - A D-Bus session and StatusNotifier host, such as KDE Plasma or GNOME with an AppIndicator extension
+- `XDG_RUNTIME_DIR` set by the desktop session
 
 ## Build and run
 
@@ -75,6 +77,8 @@ When `hide_content` is enabled, previews show only character counts. Notificatio
 `icon_name` is a Freedesktop icon-theme name resolved by the desktop, not a Unicode character or image path.
 
 `stack_size` limits the shared in-memory clipboard stack to between 1 and 16 text entries. The stack is cleared when the applet exits.
+
+Only one applet instance can run in a desktop session. A second process exits with an explanatory error. The advisory lock is released automatically when the running process exits or crashes, so a leftover lock file does not block future starts.
 
 ## Tray controls
 
