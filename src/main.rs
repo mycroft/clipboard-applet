@@ -26,7 +26,7 @@ use clipboard::{ClipboardRead, perform_action, perform_clear, read, read_both, w
 use clipboard_monitor::MonitorEvent;
 use config::UpdateMethod;
 use notification::{clipboard_change, send_change, settings as notification_settings};
-use stack::perform as perform_stack_action;
+use stack::{StackEntry, perform as perform_stack_action};
 use tray::{AppEvent, ClipboardTray, EditTarget, tooltip_text};
 
 type EditorResult = Result<(EditTarget, String, String), String>;
@@ -217,7 +217,10 @@ async fn main() {
                             let max_clipboard_bytes = config.max_clipboard_bytes;
                             let max_stack_entry_bytes = config.max_stack_entry_bytes;
                             let stack_value = match target {
-                                EditTarget::Stack(index) => stack.get(index).cloned(),
+                                EditTarget::Stack(id) => stack
+                                    .iter()
+                                    .find(|entry| entry.id == id)
+                                    .map(|entry| entry.value.clone()),
                                 EditTarget::Primary | EditTarget::Regular => None,
                             };
                             editor_task = Some(tokio::spawn(run_editor(
@@ -350,7 +353,7 @@ async fn apply_edit(
     target: EditTarget,
     original: String,
     edited: String,
-    stack: &mut [String],
+    stack: &mut [StackEntry],
     notifications: bool,
     debug: bool,
 ) -> Result<(), String> {
@@ -367,8 +370,8 @@ async fn apply_edit(
             .await
             .map_err(|error| format!("clipboard writer stopped unexpectedly: {error}"))??;
         }
-        EditTarget::Stack(index) => {
-            replace_stack_entry_if_unchanged(stack, index, &original, edited)?;
+        EditTarget::Stack(id) => {
+            replace_stack_entry_if_unchanged(stack, id, &original, edited)?;
         }
     }
     let sent = send_edit_notification(move || {
@@ -391,18 +394,19 @@ where
 }
 
 fn replace_stack_entry_if_unchanged(
-    stack: &mut [String],
-    index: usize,
+    stack: &mut [StackEntry],
+    id: u64,
     original: &str,
     value: String,
 ) -> Result<(), String> {
     let entry = stack
-        .get_mut(index)
+        .iter_mut()
+        .find(|entry| entry.id == id)
         .ok_or_else(|| "stacked entry no longer exists".to_string())?;
-    if entry != original {
+    if entry.value != original {
         return Err("stacked entry changed while it was being edited".into());
     }
-    *entry = value;
+    entry.value = value;
     Ok(())
 }
 
@@ -525,13 +529,58 @@ mod tests {
     }
 
     #[test]
-    fn stack_edit_replaces_only_an_unchanged_entry() {
-        let mut stack = vec!["oldest".into(), "target".into(), "newest".into()];
-        replace_stack_entry_if_unchanged(&mut stack, 1, "target", "edited".into()).unwrap();
-        assert_eq!(stack, ["oldest", "edited", "newest"]);
-        assert!(replace_stack_entry_if_unchanged(&mut stack, 1, "target", "stale".into()).is_err());
-        assert!(
-            replace_stack_entry_if_unchanged(&mut stack, 3, "missing", "missing".into()).is_err()
+    fn stack_edit_uses_stable_identity_with_duplicate_values() {
+        let first = StackEntry::new("duplicate".into());
+        let target = StackEntry::new("duplicate".into());
+        let last = StackEntry::new("duplicate".into());
+        let target_id = target.id;
+        let mut stack = vec![first, target, last];
+
+        stack.insert(0, StackEntry::new("pushed".into()));
+        replace_stack_entry_if_unchanged(&mut stack, target_id, "duplicate", "edited".into())
+            .unwrap();
+        assert_eq!(
+            stack
+                .iter()
+                .filter(|entry| entry.value == "edited")
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            [target_id]
         );
+
+        let removed = stack.remove(
+            stack
+                .iter()
+                .position(|entry| entry.id == target_id)
+                .unwrap(),
+        );
+        assert!(
+            replace_stack_entry_if_unchanged(&mut stack, removed.id, "edited", "stale".into())
+                .is_err()
+        );
+        assert!(stack.iter().all(|entry| entry.value != "stale"));
+    }
+
+    #[test]
+    fn stack_edit_rejects_targets_removed_by_pop_or_eviction() {
+        for remove_target in [true, false] {
+            let target = StackEntry::new("target".into());
+            let target_id = target.id;
+            let mut stack = if remove_target {
+                vec![StackEntry::new("kept".into()), target]
+            } else {
+                vec![target, StackEntry::new("kept".into())]
+            };
+            if remove_target {
+                stack.pop();
+            } else {
+                stack.remove(0);
+            }
+            assert!(
+                replace_stack_entry_if_unchanged(&mut stack, target_id, "target", "edited".into())
+                    .is_err()
+            );
+            assert_eq!(stack[0].value, "kept");
+        }
     }
 }

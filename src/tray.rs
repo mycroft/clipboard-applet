@@ -4,7 +4,7 @@ use tokio::sync::mpsc;
 use crate::clipboard::{
     ActionRequest, ActionSource, ClearTarget, ClipboardAction, ClipboardRead, read_both,
 };
-use crate::stack::StackAction;
+use crate::stack::{StackAction, StackEntry};
 
 const PREVIEW_CHARS: usize = 40;
 
@@ -22,7 +22,7 @@ pub(crate) enum AppEvent {
 pub(crate) enum EditTarget {
     Primary,
     Regular,
-    Stack(usize),
+    Stack(u64),
 }
 
 #[derive(Debug)]
@@ -34,7 +34,7 @@ pub(crate) struct ClipboardTray {
     pub(crate) middle_click: ClipboardAction,
     pub(crate) primary: ClipboardRead,
     pub(crate) regular: ClipboardRead,
-    pub(crate) stack: Vec<String>,
+    pub(crate) stack: Vec<StackEntry>,
     pub(crate) hide_content: bool,
     pub(crate) notifications_enabled: bool,
     pub(crate) editor_enabled: bool,
@@ -224,25 +224,24 @@ impl ksni::Tray for ClipboardTray {
             } else {
                 if self.editor_enabled {
                     menu.extend(self.stack.iter().rev().enumerate().map(
-                        |(display_index, value)| {
-                            let stack_index = self.stack.len() - 1 - display_index;
+                        |(display_index, entry)| {
                             let label = if self.hide_content {
                                 format!("Edit stacked entry {}", display_index + 1)
                             } else {
                                 format!(
                                     "Edit {}: {}",
                                     display_index + 1,
-                                    preview_text(value, false)
+                                    preview_text(&entry.value, false)
                                 )
                                 .replace('_', "__")
                             };
-                            edit_item(label, EditTarget::Stack(stack_index), !self.editor_busy)
+                            edit_item(label, EditTarget::Stack(entry.id), !self.editor_busy)
                         },
                     ));
                 } else if !self.hide_content {
-                    menu.extend(self.stack.iter().rev().enumerate().map(|(index, value)| {
+                    menu.extend(self.stack.iter().rev().enumerate().map(|(index, entry)| {
                         StandardItem {
-                            label: format!("{}: {}", index + 1, preview_text(value, false))
+                            label: format!("{}: {}", index + 1, preview_text(&entry.value, false))
                                 .replace('_', "__"),
                             enabled: false,
                             ..Default::default()
@@ -355,7 +354,10 @@ mod tests {
                 middle_click: ClipboardAction::Switch,
                 primary: ClipboardRead::Text("primary".into()),
                 regular: ClipboardRead::Text("regular".into()),
-                stack: vec!["oldest".into(), "newest".into()],
+                stack: vec![
+                    StackEntry::new("oldest".into()),
+                    StackEntry::new("newest".into()),
+                ],
                 hide_content: false,
                 notifications_enabled: false,
                 editor_enabled: true,
@@ -437,11 +439,13 @@ mod tests {
     #[test]
     fn edit_menu_items_send_selection_and_stack_targets() {
         let (mut tray, mut receiver) = editable_tray();
+        let newest_id = tray.stack[1].id;
+        let oldest_id = tray.stack[0].id;
         for (label, expected) in [
             ("Edit primary", EditTarget::Primary),
             ("Edit regular", EditTarget::Regular),
-            ("Edit 1: newest", EditTarget::Stack(1)),
-            ("Edit 2: oldest", EditTarget::Stack(0)),
+            ("Edit 1: newest", EditTarget::Stack(newest_id)),
+            ("Edit 2: oldest", EditTarget::Stack(oldest_id)),
         ] {
             let item = ksni::Tray::menu(&tray)
                 .into_iter()

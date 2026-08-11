@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use wl_clipboard_rs::copy::ClipboardType as CopyClipboardType;
 use wl_clipboard_rs::paste::ClipboardType;
 
@@ -15,9 +17,25 @@ pub(crate) enum StackAction {
     PopBoth,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StackEntry {
+    pub(crate) id: u64,
+    pub(crate) value: String,
+}
+
+impl StackEntry {
+    pub(crate) fn new(value: String) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            value,
+        }
+    }
+}
+
 pub(crate) fn perform(
     action: StackAction,
-    stack: &mut Vec<String>,
+    stack: &mut Vec<StackEntry>,
     capacity: usize,
     max_clipboard_bytes: u64,
     max_entry_bytes: u64,
@@ -63,7 +81,7 @@ pub(crate) fn perform(
         StackAction::PopPrimary | StackAction::PopRegular => {
             let value = stack
                 .last()
-                .cloned()
+                .map(|entry| entry.value.clone())
                 .ok_or_else(|| "clipboard stack is empty".to_string())?;
             validate_clipboard_size(&value, max_clipboard_bytes)?;
             let clipboard = if action == StackAction::PopPrimary {
@@ -119,7 +137,7 @@ fn validate_clipboard_size(value: &str, max_bytes: u64) -> Result<(), String> {
 }
 
 fn pop_to_both<FRead, FWrite>(
-    stack: &mut Vec<String>,
+    stack: &mut Vec<StackEntry>,
     debug: bool,
     max_clipboard_bytes: u64,
     read: FRead,
@@ -131,7 +149,7 @@ where
 {
     let value = stack
         .last()
-        .cloned()
+        .map(|entry| entry.value.clone())
         .ok_or_else(|| "clipboard stack is empty".to_string())?;
     validate_clipboard_size(&value, max_clipboard_bytes)?;
     let (original_primary, original_regular) = read()?;
@@ -151,11 +169,11 @@ where
     Ok(())
 }
 
-fn push(stack: &mut Vec<String>, value: String, capacity: usize) {
+fn push(stack: &mut Vec<StackEntry>, value: String, capacity: usize) {
     if stack.len() == capacity {
         stack.remove(0);
     }
-    stack.push(value);
+    stack.push(StackEntry::new(value));
 }
 
 fn notification_body(action: StackAction) -> &'static str {
@@ -172,11 +190,20 @@ fn notification_body(action: StackAction) -> &'static str {
 mod tests {
     use super::*;
 
+    fn entry(value: &str) -> StackEntry {
+        StackEntry::new(value.into())
+    }
+
+    fn values(stack: &[StackEntry]) -> Vec<&str> {
+        stack.iter().map(|entry| entry.value.as_str()).collect()
+    }
+
     #[test]
     fn push_evicts_oldest_entry_at_capacity() {
-        let mut stack = vec!["one".into(), "two".into()];
+        let mut stack = vec![entry("one"), entry("two")];
         push(&mut stack, "three".into(), 2);
-        assert_eq!(stack, ["two", "three"]);
+        assert_eq!(values(&stack), ["two", "three"]);
+        assert_ne!(stack[0].id, stack[1].id);
     }
 
     #[test]
@@ -195,7 +222,7 @@ mod tests {
 
     #[test]
     fn failed_pop_to_both_keeps_entry() {
-        let mut stack = vec!["value".into()];
+        let mut stack = vec![entry("value")];
         let result = pop_to_both(
             &mut stack,
             false,
@@ -210,12 +237,12 @@ mod tests {
             },
         );
         assert!(result.is_err());
-        assert_eq!(stack, ["value"]);
+        assert_eq!(values(&stack), ["value"]);
     }
 
     #[test]
     fn pop_to_both_does_not_write_without_safe_rollback_text() {
-        let mut stack = vec!["value".into()];
+        let mut stack = vec![entry("value")];
         let mut writes = Vec::new();
         let result = pop_to_both(
             &mut stack,
@@ -229,6 +256,6 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(writes.is_empty());
-        assert_eq!(stack, ["value"]);
+        assert_eq!(values(&stack), ["value"]);
     }
 }
