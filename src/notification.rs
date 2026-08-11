@@ -23,16 +23,33 @@ pub(crate) enum ClipboardChange {
     Both,
 }
 
+pub(crate) type ClipboardObservations = (Option<Option<String>>, Option<Option<String>>);
+
 pub(crate) fn clipboard_change(
-    previous: &(Option<String>, Option<String>),
-    current: &(Option<String>, Option<String>),
+    previous: &mut ClipboardObservations,
+    current: &ClipboardObservations,
 ) -> Option<ClipboardChange> {
-    match (previous.0 != current.0, previous.1 != current.1) {
+    let primary_changed = observed_value_changed(&previous.0, &current.0);
+    let regular_changed = observed_value_changed(&previous.1, &current.1);
+    if current.0.is_some() {
+        previous.0 = current.0.clone();
+    }
+    if current.1.is_some() {
+        previous.1 = current.1.clone();
+    }
+    match (primary_changed, regular_changed) {
         (true, true) => Some(ClipboardChange::Both),
         (true, false) => Some(ClipboardChange::Primary),
         (false, true) => Some(ClipboardChange::Regular),
         (false, false) => None,
     }
+}
+
+fn observed_value_changed(
+    previous: &Option<Option<String>>,
+    current: &Option<Option<String>>,
+) -> bool {
+    matches!((previous, current), (Some(previous), Some(current)) if previous != current)
 }
 
 pub(crate) fn send(body: &str, context: &str) -> bool {
@@ -70,20 +87,48 @@ mod tests {
 
     #[test]
     fn detects_each_clipboard_change() {
-        let empty = (None, None);
+        let mut previous = (Some(None), Some(None));
         assert_eq!(
-            clipboard_change(&empty, &(Some("p".into()), None)),
+            clipboard_change(&mut previous, &(Some(Some("p".into())), Some(None))),
             Some(ClipboardChange::Primary)
         );
+        previous = (Some(None), Some(None));
         assert_eq!(
-            clipboard_change(&empty, &(None, Some("r".into()))),
+            clipboard_change(&mut previous, &(Some(None), Some(Some("r".into())))),
             Some(ClipboardChange::Regular)
         );
+        previous = (Some(None), Some(None));
         assert_eq!(
-            clipboard_change(&empty, &(Some("p".into()), Some("r".into()))),
+            clipboard_change(
+                &mut previous,
+                &(Some(Some("p".into())), Some(Some("r".into())))
+            ),
             Some(ClipboardChange::Both)
         );
-        assert_eq!(clipboard_change(&empty, &empty), None);
+        assert_eq!(
+            clipboard_change(
+                &mut previous,
+                &(Some(Some("p".into())), Some(Some("r".into())))
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn unavailable_selection_does_not_hide_healthy_changes_or_advance_history() {
+        let mut previous = (
+            Some(Some("old primary".into())),
+            Some(Some("old regular".into())),
+        );
+        assert_eq!(
+            clipboard_change(&mut previous, &(None, Some(Some("new regular".into())))),
+            Some(ClipboardChange::Regular)
+        );
+        assert_eq!(previous.0, Some(Some("old primary".into())));
+        assert_eq!(
+            clipboard_change(&mut previous, &(Some(Some("old primary".into())), None)),
+            None
+        );
     }
 
     #[test]

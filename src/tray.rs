@@ -1,7 +1,9 @@
 use ksni::ToolTip;
 use tokio::sync::mpsc;
 
-use crate::clipboard::{ActionRequest, ActionSource, ClearTarget, ClipboardAction, read_both};
+use crate::clipboard::{
+    ActionRequest, ActionSource, ClearTarget, ClipboardAction, ClipboardRead, read_both,
+};
 use crate::stack::StackAction;
 
 const PREVIEW_CHARS: usize = 40;
@@ -30,8 +32,8 @@ pub(crate) struct ClipboardTray {
     pub(crate) event_sender: mpsc::UnboundedSender<AppEvent>,
     pub(crate) left_click: ClipboardAction,
     pub(crate) middle_click: ClipboardAction,
-    pub(crate) primary: Option<String>,
-    pub(crate) regular: Option<String>,
+    pub(crate) primary: ClipboardRead,
+    pub(crate) regular: ClipboardRead,
     pub(crate) stack: Vec<String>,
     pub(crate) hide_content: bool,
     pub(crate) notifications_enabled: bool,
@@ -71,7 +73,7 @@ impl ksni::Tray for ClipboardTray {
     }
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         use ksni::menu::StandardItem;
-        let preview_item = |name: &str, value: Option<&str>| {
+        let preview_item = |name: &str, value: &ClipboardRead| {
             StandardItem {
                 label: menu_label(name, value, self.hide_content),
                 enabled: false,
@@ -134,64 +136,65 @@ impl ksni::Tray for ClipboardTray {
             }
             .into()
         };
-        let any_content =
-            has_content(self.primary.as_deref()) || has_content(self.regular.as_deref());
-        let mut menu = vec![preview_item("Primary", self.primary.as_deref())];
+        let any_content = has_content(&self.primary) || has_content(&self.regular);
+        let switch_enabled =
+            any_content && is_switchable(&self.primary) && is_switchable(&self.regular);
+        let mut menu = vec![preview_item("Primary", &self.primary)];
         if self.editor_enabled {
             menu.push(edit_item(
                 "Edit primary".into(),
                 EditTarget::Primary,
-                has_content(self.primary.as_deref()),
+                has_content(&self.primary),
             ));
         }
         menu.push(action_item(
             "Copy primary to regular",
             ClipboardAction::CopyPrimary,
-            has_content(self.primary.as_deref()),
+            has_content(&self.primary),
         ));
         if self.stack_enabled {
             menu.push(stack_item(
                 "Stack primary",
                 StackAction::PushPrimary,
-                has_content(self.primary.as_deref()),
+                has_content(&self.primary),
             ));
         }
         menu.extend([
             clear_item(
                 "Clear primary",
                 ClearTarget::Primary,
-                has_content(self.primary.as_deref()),
+                has_content(&self.primary),
             ),
             separator_item(),
-            preview_item("Regular", self.regular.as_deref()),
+            preview_item("Regular", &self.regular),
         ]);
         if self.editor_enabled {
             menu.push(edit_item(
                 "Edit regular".into(),
                 EditTarget::Regular,
-                has_content(self.regular.as_deref()),
+                has_content(&self.regular),
             ));
         }
         menu.push(action_item(
             "Copy regular to primary",
             ClipboardAction::CopyRegular,
-            has_content(self.regular.as_deref()),
+            has_content(&self.regular),
         ));
         if self.stack_enabled {
             menu.push(stack_item(
                 "Stack regular",
                 StackAction::PushRegular,
-                has_content(self.regular.as_deref()),
+                has_content(&self.regular),
             ));
         }
         menu.extend([
             clear_item(
                 "Clear regular",
                 ClearTarget::Regular,
-                has_content(self.regular.as_deref()),
+                has_content(&self.regular),
             ),
             separator_item(),
-            action_item("Switch clipboards", ClipboardAction::Switch, any_content),
+            action_item("Switch clipboards", ClipboardAction::Switch, switch_enabled),
             action_item("Reset clipboards", ClipboardAction::Reset, any_content),
         ]);
         if self.stack_enabled {
@@ -216,7 +219,7 @@ impl ksni::Tray for ClipboardTray {
                                 format!(
                                     "Edit {}: {}",
                                     display_index + 1,
-                                    preview(Some(value), false)
+                                    preview_text(value, false)
                                 )
                                 .replace('_', "__")
                             };
@@ -226,7 +229,7 @@ impl ksni::Tray for ClipboardTray {
                 } else if !self.hide_content {
                     menu.extend(self.stack.iter().rev().enumerate().map(|(index, value)| {
                         StandardItem {
-                            label: format!("{}: {}", index + 1, preview(Some(value), false))
+                            label: format!("{}: {}", index + 1, preview_text(value, false))
                                 .replace('_', "__"),
                             enabled: false,
                             ..Default::default()
@@ -273,7 +276,7 @@ impl ksni::Tray for ClipboardTray {
     }
 }
 
-pub(crate) fn tooltip_text(primary: Option<&str>, regular: Option<&str>, hide: bool) -> String {
+pub(crate) fn tooltip_text(primary: &ClipboardRead, regular: &ClipboardRead, hide: bool) -> String {
     format!(
         "primary: {}\nregular: {}",
         preview(primary, hide),
@@ -281,22 +284,34 @@ pub(crate) fn tooltip_text(primary: Option<&str>, regular: Option<&str>, hide: b
     )
 }
 
-fn menu_label(name: &str, value: Option<&str>, hide: bool) -> String {
+fn menu_label(name: &str, value: &ClipboardRead, hide: bool) -> String {
     format!("{name}: {}", preview(value, hide)).replace('_', "__")
 }
 
-fn has_content(value: Option<&str>) -> bool {
-    value.is_some_and(|value| !value.is_empty())
+fn has_content(value: &ClipboardRead) -> bool {
+    matches!(value, ClipboardRead::Text(value) if !value.is_empty())
 }
 
-fn preview(value: Option<&str>, hide: bool) -> String {
+fn is_switchable(value: &ClipboardRead) -> bool {
+    matches!(value, ClipboardRead::Text(_) | ClipboardRead::Empty)
+}
+
+fn preview(value: &ClipboardRead, hide: bool) -> String {
+    match value {
+        ClipboardRead::Text(value) => preview_text(value, hide),
+        ClipboardRead::Empty => if hide { "0 chars" } else { "(empty)" }.into(),
+        ClipboardRead::NonText => "(non-text)".into(),
+        ClipboardRead::Unsupported => "(unsupported)".into(),
+        ClipboardRead::Oversized { limit } => format!("(over {limit} bytes)"),
+        ClipboardRead::Error(_) => "(unavailable)".into(),
+    }
+}
+
+fn preview_text(value: &str, hide: bool) -> String {
     if hide {
-        let length = value.map_or(0, |value| value.chars().count());
+        let length = value.chars().count();
         return format!("{length} {}", if length == 1 { "char" } else { "chars" });
     }
-    let Some(value) = value else {
-        return "(empty)".into();
-    };
     let total = value.chars().count();
     let visible: String = value
         .chars()
@@ -325,8 +340,8 @@ mod tests {
                 event_sender,
                 left_click: ClipboardAction::CopyPrimary,
                 middle_click: ClipboardAction::Switch,
-                primary: Some("primary".into()),
-                regular: Some("regular".into()),
+                primary: ClipboardRead::Text("primary".into()),
+                regular: ClipboardRead::Text("regular".into()),
                 stack: vec!["oldest".into(), "newest".into()],
                 hide_content: false,
                 notifications_enabled: false,
@@ -340,20 +355,20 @@ mod tests {
 
     #[test]
     fn preview_hides_content_and_counts_characters() {
-        assert_eq!(preview(Some("é🙂"), true), "2 chars");
-        assert_eq!(preview(None, true), "0 chars");
+        assert_eq!(preview(&ClipboardRead::Text("é🙂".into()), true), "2 chars");
+        assert_eq!(preview(&ClipboardRead::Empty, true), "0 chars");
     }
 
     #[test]
     fn preview_flattens_control_whitespace() {
-        assert_eq!(preview(Some("one\ntwo\tthree"), false), "one two three");
+        assert_eq!(preview_text("one\ntwo\tthree", false), "one two three");
     }
 
     #[test]
     fn preview_truncates_by_characters() {
         let value = "🙂".repeat(PREVIEW_CHARS + 3);
         assert_eq!(
-            preview(Some(&value), false),
+            preview_text(&value, false),
             format!("{}... (and 3 more chars)", "🙂".repeat(PREVIEW_CHARS))
         );
     }
@@ -361,9 +376,48 @@ mod tests {
     #[test]
     fn menu_labels_escape_underscores() {
         assert_eq!(
-            menu_label("Primary", Some("one_two"), false),
+            menu_label("Primary", &ClipboardRead::Text("one_two".into()), false),
             "Primary: one__two"
         );
+    }
+
+    #[test]
+    fn preview_reports_each_unavailable_state_independently() {
+        assert_eq!(preview(&ClipboardRead::NonText, false), "(non-text)");
+        assert_eq!(preview(&ClipboardRead::Unsupported, false), "(unsupported)");
+        assert_eq!(
+            preview(&ClipboardRead::Oversized { limit: 1024 }, false),
+            "(over 1024 bytes)"
+        );
+        assert_eq!(
+            preview(&ClipboardRead::Error("failed".into()), false),
+            "(unavailable)"
+        );
+        assert_eq!(
+            tooltip_text(
+                &ClipboardRead::Error("failed".into()),
+                &ClipboardRead::Text("healthy".into()),
+                false
+            ),
+            "primary: (unavailable)\nregular: healthy"
+        );
+    }
+
+    #[test]
+    fn healthy_selection_actions_remain_enabled_when_the_other_read_fails() {
+        let (mut tray, _) = editable_tray();
+        tray.primary = ClipboardRead::Error("failed".into());
+        let items = ksni::Tray::menu(&tray);
+        let enabled = |label: &str| {
+            items.iter().find_map(|item| match item {
+                ksni::MenuItem::Standard(item) if item.label == label => Some(item.enabled),
+                _ => None,
+            })
+        };
+        assert_eq!(enabled("Copy primary to regular"), Some(false));
+        assert_eq!(enabled("Copy regular to primary"), Some(true));
+        assert_eq!(enabled("Switch clipboards"), Some(false));
+        assert_eq!(enabled("Reset clipboards"), Some(true));
     }
 
     #[test]

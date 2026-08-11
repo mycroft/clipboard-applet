@@ -21,7 +21,7 @@ use wl_clipboard_rs::copy::ClipboardType as CopyClipboardType;
 use wl_clipboard_rs::paste::ClipboardType;
 
 use cli::{CliAction, parse_args, print_help};
-use clipboard::{perform_action, perform_clear, read, try_read_both, write};
+use clipboard::{ClipboardRead, perform_action, perform_clear, read, read_both, write};
 use clipboard_monitor::MonitorEvent;
 use config::UpdateMethod;
 use notification::{clipboard_change, send_change, settings as notification_settings};
@@ -88,15 +88,17 @@ async fn main() {
     let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
     let (monitor_sender, mut monitor_receiver) = mpsc::channel(1);
     let mut stack = Vec::new();
-    let mut previous_clipboards = None;
+    let mut previous_clipboards = (None, None);
+    let initial_primary = ClipboardRead::Empty;
+    let initial_regular = ClipboardRead::Empty;
     let tray = ClipboardTray {
-        tooltip: tooltip_text(None, None, config.hide_content),
+        tooltip: tooltip_text(&initial_primary, &initial_regular, config.hide_content),
         icon_name: config.icon_name.clone(),
         event_sender,
         left_click: config.left_click,
         middle_click: config.middle_click,
-        primary: None,
-        regular: None,
+        primary: initial_primary,
+        regular: initial_regular,
         stack: Vec::new(),
         hide_content: config.hide_content,
         notifications_enabled,
@@ -235,33 +237,26 @@ async fn main() {
             }
         }
 
-        let ((primary, regular), read_succeeded) = match tokio::task::spawn_blocking({
+        let (primary, regular) = match tokio::task::spawn_blocking({
             let max_bytes = config.max_clipboard_bytes;
-            move || try_read_both(max_bytes)
+            move || read_both(max_bytes)
         })
         .await
         {
-            Ok(Ok(clipboards)) => (clipboards, true),
-            Ok(Err(error)) => {
-                eprintln!("could not read clipboards: {error}");
-                ((None, None), false)
-            }
+            Ok(clipboards) => clipboards,
             Err(error) => {
                 eprintln!("clipboard reader stopped unexpectedly: {error}");
-                ((None, None), false)
+                let error = error.to_string();
+                (
+                    ClipboardRead::Error(error.clone()),
+                    ClipboardRead::Error(error),
+                )
             }
         };
-        let current_clipboards = (primary.clone(), regular.clone());
-        let change = read_succeeded
-            .then(|| {
-                previous_clipboards
-                    .as_ref()
-                    .and_then(|previous| clipboard_change(previous, &current_clipboards))
-            })
-            .flatten();
-        if read_succeeded {
-            previous_clipboards = Some(current_clipboards);
-        }
+        report_read_issue("primary", &primary);
+        report_read_issue("regular", &regular);
+        let current_clipboards = (primary.observation(), regular.observation());
+        let change = clipboard_change(&mut previous_clipboards, &current_clipboards);
         if check_for_change
             && notify_on_change
             && notifications_enabled
@@ -274,7 +269,7 @@ async fn main() {
                 change.is_some()
             );
         }
-        let tooltip = tooltip_text(primary.as_deref(), regular.as_deref(), config.hide_content);
+        let tooltip = tooltip_text(&primary, &regular, config.hide_content);
         handle
             .update(|tray| {
                 tray.tooltip = tooltip;
@@ -335,6 +330,21 @@ fn replace_stack_entry(stack: &mut [String], index: usize, value: String) -> Res
         .ok_or_else(|| "stacked entry no longer exists".to_string())?;
     *entry = value;
     Ok(())
+}
+
+fn report_read_issue(selection: &str, value: &ClipboardRead) {
+    match value {
+        ClipboardRead::Oversized { limit } => {
+            eprintln!("could not read {selection} clipboard: content exceeds {limit} bytes");
+        }
+        ClipboardRead::Error(error) => {
+            eprintln!("could not read {selection} clipboard: {error}");
+        }
+        ClipboardRead::Text(_)
+        | ClipboardRead::Empty
+        | ClipboardRead::NonText
+        | ClipboardRead::Unsupported => {}
+    }
 }
 
 fn new_poll_interval(period: Duration) -> tokio::time::Interval {

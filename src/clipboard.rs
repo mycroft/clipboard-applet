@@ -83,6 +83,14 @@ impl ClipboardRead {
         }
     }
 
+    pub(crate) fn observation(&self) -> Option<Option<String>> {
+        match self {
+            Self::Text(value) => Some(Some(value.clone())),
+            Self::Empty => Some(None),
+            Self::NonText | Self::Unsupported | Self::Oversized { .. } | Self::Error(_) => None,
+        }
+    }
+
     fn into_text(self, source: &str) -> Result<String, String> {
         match self {
             Self::Text(value) => Ok(value),
@@ -125,18 +133,20 @@ impl ClipboardRead {
     }
 }
 
-pub(crate) fn read_both(max_bytes: u64) -> (Option<String>, Option<String>) {
-    try_read_both(max_bytes).unwrap_or_else(|error| {
-        eprintln!("could not read clipboards: {error}");
-        (None, None)
-    })
+pub(crate) fn read_both(max_bytes: u64) -> (ClipboardRead, ClipboardRead) {
+    read_both_with(|clipboard| read(clipboard, max_bytes))
+}
+
+fn read_both_with<F>(mut read: F) -> (ClipboardRead, ClipboardRead)
+where
+    F: FnMut(ClipboardType) -> ClipboardRead,
+{
+    (read(ClipboardType::Primary), read(ClipboardType::Regular))
 }
 
 pub(crate) fn try_read_both(max_bytes: u64) -> Result<(Option<String>, Option<String>), String> {
-    Ok((
-        read(ClipboardType::Primary, max_bytes).into_display()?,
-        read(ClipboardType::Regular, max_bytes).into_display()?,
-    ))
+    let (primary, regular) = read_both(max_bytes);
+    Ok((primary.into_display()?, regular.into_display()?))
 }
 
 pub(crate) fn read(clipboard: ClipboardType, max_bytes: u64) -> ClipboardRead {
@@ -464,6 +474,61 @@ mod tests {
         assert_eq!(ClipboardRead::Unsupported.state(), "Unsupported");
         assert_eq!(ClipboardRead::Oversized { limit: 10 }.state(), "Oversized");
         assert_eq!(ClipboardRead::Error("failed".into()).state(), "Error");
+    }
+
+    #[test]
+    fn reads_each_selection_even_when_the_other_fails() {
+        for (failed_selection, expected) in [
+            (
+                ClipboardType::Primary,
+                (
+                    ClipboardRead::Error("failed".into()),
+                    ClipboardRead::Text("regular".into()),
+                ),
+            ),
+            (
+                ClipboardType::Regular,
+                (
+                    ClipboardRead::Text("primary".into()),
+                    ClipboardRead::Error("failed".into()),
+                ),
+            ),
+        ] {
+            let mut reads = Vec::new();
+            let actual = read_both_with(|selection| {
+                reads.push(selection);
+                if selection == failed_selection {
+                    ClipboardRead::Error("failed".into())
+                } else {
+                    ClipboardRead::Text(
+                        match selection {
+                            ClipboardType::Primary => "primary",
+                            ClipboardType::Regular => "regular",
+                        }
+                        .into(),
+                    )
+                }
+            });
+            assert_eq!(actual, expected);
+            assert_eq!(reads, [ClipboardType::Primary, ClipboardType::Regular]);
+        }
+
+        let both_failed =
+            read_both_with(|selection| ClipboardRead::Error(format!("{selection:?} failed")));
+        assert!(matches!(both_failed.0, ClipboardRead::Error(_)));
+        assert!(matches!(both_failed.1, ClipboardRead::Error(_)));
+    }
+
+    #[test]
+    fn only_text_and_empty_are_change_observations() {
+        assert_eq!(
+            ClipboardRead::Text("value".into()).observation(),
+            Some(Some("value".into()))
+        );
+        assert_eq!(ClipboardRead::Empty.observation(), Some(None));
+        for state in unsafe_switch_states() {
+            assert_eq!(state.observation(), None);
+        }
     }
 
     #[test]
