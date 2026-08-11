@@ -53,17 +53,31 @@ fn observed_value_changed(
 }
 
 pub(crate) fn send(body: &str, context: &str) -> bool {
-    if let Err(error) = notify_rust::Notification::new()
-        .summary("Clipboard applet")
-        .body(body)
-        .icon("edit-paste")
-        .show()
-    {
-        eprintln!("could not send {context} notification: {error}");
-        false
-    } else {
-        true
+    match run_without_runtime(|| {
+        notify_rust::Notification::new()
+            .summary("Clipboard applet")
+            .body(body)
+            .icon("edit-paste")
+            .show()
+    }) {
+        Ok(Ok(_)) => true,
+        Ok(Err(error)) => {
+            eprintln!("could not send {context} notification: {error}");
+            false
+        }
+        Err(_) => {
+            eprintln!("could not send {context} notification: notification worker panicked");
+            false
+        }
     }
+}
+
+fn run_without_runtime<F, T>(task: F) -> std::thread::Result<T>
+where
+    F: FnOnce() -> T + Send,
+    T: Send,
+{
+    std::thread::scope(|scope| scope.spawn(task).join())
 }
 
 pub(crate) fn send_if_enabled(body: &str, context: &str, enabled: bool) -> bool {
@@ -148,5 +162,12 @@ mod tests {
             (true, false)
         );
         assert_eq!(settings(&config, Some(NotificationMode::All)), (true, true));
+    }
+
+    #[tokio::test]
+    async fn notification_worker_has_no_tokio_runtime_context() {
+        let outside_runtime =
+            run_without_runtime(|| tokio::runtime::Handle::try_current().is_err()).unwrap();
+        assert!(outside_runtime);
     }
 }

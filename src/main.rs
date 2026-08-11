@@ -371,12 +371,23 @@ async fn apply_edit(
             replace_stack_entry_if_unchanged(stack, index, &original, edited)?;
         }
     }
-    let sent =
-        notification::send_if_enabled("Clipboard value edited", "clipboard edit", notifications);
+    let sent = send_edit_notification(move || {
+        notification::send_if_enabled("Clipboard value edited", "clipboard edit", notifications)
+    })
+    .await?;
     if sent && debug {
         eprintln!("[debug] edit notification sent: target={target:?}");
     }
     Ok(())
+}
+
+async fn send_edit_notification<F>(send: F) -> Result<bool, String>
+where
+    F: FnOnce() -> bool + Send + 'static,
+{
+    tokio::task::spawn_blocking(send)
+        .await
+        .map_err(|error| format!("edit notification worker stopped unexpectedly: {error}"))
 }
 
 fn replace_stack_entry_if_unchanged(
