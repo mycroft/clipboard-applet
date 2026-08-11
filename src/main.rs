@@ -36,6 +36,18 @@ struct EditorSession {
     task: JoinHandle<EditorResult>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ClipboardReadIssue {
+    Oversized { limit: u64 },
+    Error(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ReadLogTransition {
+    Issue(ClipboardReadIssue),
+    Recovered,
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let action = parse_args(std::env::args_os().skip(1)).unwrap_or_else(|error| {
@@ -97,6 +109,7 @@ async fn main() {
     let (monitor_sender, mut monitor_receiver) = mpsc::channel(1);
     let mut stack = Vec::new();
     let mut previous_clipboards = (None, None);
+    let mut read_issues = (None, None);
     let initial_primary = ClipboardRead::Empty;
     let initial_regular = ClipboardRead::Empty;
     let tray = ClipboardTray {
@@ -292,8 +305,8 @@ async fn main() {
                 )
             }
         };
-        report_read_issue("primary", &primary);
-        report_read_issue("regular", &regular);
+        report_read_transition("primary", &primary, &mut read_issues.0);
+        report_read_transition("regular", &regular, &mut read_issues.1);
         let current_clipboards = (primary.observation(), regular.observation());
         let change = clipboard_change(&mut previous_clipboards, &current_clipboards);
         if check_for_change
@@ -437,19 +450,42 @@ async fn cancel_editor(session: &mut Option<EditorSession>) -> Option<EditTarget
 
 type EditorResultJoin = Result<EditorResult, tokio::task::JoinError>;
 
-fn report_read_issue(selection: &str, value: &ClipboardRead) {
-    match value {
-        ClipboardRead::Oversized { limit } => {
+fn report_read_transition(
+    selection: &str,
+    value: &ClipboardRead,
+    previous: &mut Option<ClipboardReadIssue>,
+) {
+    match read_log_transition(previous, value) {
+        Some(ReadLogTransition::Issue(ClipboardReadIssue::Oversized { limit })) => {
             eprintln!("could not read {selection} clipboard: content exceeds {limit} bytes");
         }
-        ClipboardRead::Error(error) => {
+        Some(ReadLogTransition::Issue(ClipboardReadIssue::Error(error))) => {
             eprintln!("could not read {selection} clipboard: {error}");
         }
-        ClipboardRead::Text(_)
-        | ClipboardRead::Empty
-        | ClipboardRead::NonText
-        | ClipboardRead::Unsupported => {}
+        Some(ReadLogTransition::Recovered) => {
+            eprintln!("{selection} clipboard is readable again");
+        }
+        None => {}
     }
+}
+
+fn read_log_transition(
+    previous: &mut Option<ClipboardReadIssue>,
+    value: &ClipboardRead,
+) -> Option<ReadLogTransition> {
+    let current = match value {
+        ClipboardRead::Oversized { limit } => Some(ClipboardReadIssue::Oversized { limit: *limit }),
+        ClipboardRead::Error(error) => Some(ClipboardReadIssue::Error(error.clone())),
+        ClipboardRead::Text(_) | ClipboardRead::Empty => {
+            return previous.take().map(|_| ReadLogTransition::Recovered);
+        }
+        ClipboardRead::NonText | ClipboardRead::Unsupported => return None,
+    };
+    if previous.as_ref() == current.as_ref() {
+        return None;
+    }
+    *previous = current.clone();
+    current.map(ReadLogTransition::Issue)
 }
 
 fn new_poll_interval(period: Duration) -> tokio::time::Interval {
@@ -625,5 +661,64 @@ mod tests {
         });
         assert_eq!(cancel_editor(&mut session).await, Some(EditTarget::Primary));
         assert!(session.is_none());
+    }
+
+    #[test]
+    fn read_logging_reports_changes_and_recovery_only_once() {
+        let mut previous = None;
+        assert_eq!(
+            read_log_transition(&mut previous, &ClipboardRead::Error("first".into())),
+            Some(ReadLogTransition::Issue(ClipboardReadIssue::Error(
+                "first".into()
+            )))
+        );
+        assert_eq!(
+            read_log_transition(&mut previous, &ClipboardRead::Error("first".into())),
+            None
+        );
+        assert_eq!(
+            read_log_transition(&mut previous, &ClipboardRead::Error("changed".into())),
+            Some(ReadLogTransition::Issue(ClipboardReadIssue::Error(
+                "changed".into()
+            )))
+        );
+        assert_eq!(
+            read_log_transition(&mut previous, &ClipboardRead::NonText),
+            None
+        );
+        assert_eq!(
+            read_log_transition(&mut previous, &ClipboardRead::Text("healthy".into())),
+            Some(ReadLogTransition::Recovered)
+        );
+        assert_eq!(
+            read_log_transition(&mut previous, &ClipboardRead::Empty),
+            None
+        );
+    }
+
+    #[test]
+    fn oversized_and_selection_states_are_tracked_independently() {
+        let mut primary = None;
+        let mut regular = None;
+        assert!(matches!(
+            read_log_transition(&mut primary, &ClipboardRead::Oversized { limit: 1024 }),
+            Some(ReadLogTransition::Issue(ClipboardReadIssue::Oversized {
+                limit: 1024
+            }))
+        ));
+        assert!(matches!(
+            read_log_transition(&mut regular, &ClipboardRead::Error("failed".into())),
+            Some(ReadLogTransition::Issue(ClipboardReadIssue::Error(_)))
+        ));
+        assert_eq!(
+            read_log_transition(&mut primary, &ClipboardRead::Oversized { limit: 1024 }),
+            None
+        );
+        assert_eq!(
+            read_log_transition(&mut regular, &ClipboardRead::Text("healthy".into())),
+            Some(ReadLogTransition::Recovered)
+        );
+        assert_eq!(primary, Some(ClipboardReadIssue::Oversized { limit: 1024 }));
+        assert_eq!(regular, None);
     }
 }
