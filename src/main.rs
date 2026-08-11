@@ -31,6 +31,11 @@ use tray::{AppEvent, ClipboardTray, EditTarget, tooltip_text};
 
 type EditorResult = Result<(EditTarget, String, String), String>;
 
+struct EditorSession {
+    target: EditTarget,
+    task: JoinHandle<EditorResult>,
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let action = parse_args(std::env::args_os().skip(1)).unwrap_or_else(|error| {
@@ -106,7 +111,7 @@ async fn main() {
         hide_content: config.hide_content,
         notifications_enabled,
         editor_enabled: !config.editor.is_empty(),
-        editor_busy: false,
+        editor_target: None,
         stack_enabled: config.stack_enabled,
         max_clipboard_bytes: config.max_clipboard_bytes,
     };
@@ -136,7 +141,7 @@ async fn main() {
         eprintln!("failed to install SIGTERM handler: {error}");
         std::process::exit(1);
     });
-    let mut editor_task: Option<JoinHandle<EditorResult>> = None;
+    let mut editor_session: Option<EditorSession> = None;
 
     loop {
         let mut check_for_change = false;
@@ -210,7 +215,7 @@ async fn main() {
                         }
                     }
                     AppEvent::Edit(target) => {
-                        if editor_task.is_some() {
+                        if editor_session.is_some() {
                             eprintln!("could not edit clipboard value: an editor is already running");
                         } else {
                             let command = config.editor.clone();
@@ -223,15 +228,25 @@ async fn main() {
                                     .map(|entry| entry.value.clone()),
                                 EditTarget::Primary | EditTarget::Regular => None,
                             };
-                            editor_task = Some(tokio::spawn(run_editor(
+                            editor_session = Some(EditorSession {
                                 target,
-                                stack_value,
-                                command,
-                                max_clipboard_bytes,
-                                max_stack_entry_bytes,
-                                debug,
-                            )));
+                                task: tokio::spawn(run_editor(
+                                    target,
+                                    stack_value,
+                                    command,
+                                    max_clipboard_bytes,
+                                    max_stack_entry_bytes,
+                                    debug,
+                                )),
+                            });
                             if debug { eprintln!("[debug] editor task started: target={target:?}"); }
+                        }
+                    }
+                    AppEvent::CancelEdit => {
+                        if let Some(target) = cancel_editor(&mut editor_session).await {
+                            if debug { eprintln!("[debug] editor task cancelled: target={target:?}"); }
+                        } else if debug {
+                            eprintln!("[debug] editor cancellation ignored: no active editor");
                         }
                     }
                     AppEvent::ToggleNotifications => {
@@ -240,8 +255,8 @@ async fn main() {
                     }
                 }
             }
-            result = wait_for_editor(&mut editor_task) => {
-                editor_task = None;
+            result = wait_for_editor(&mut editor_session) => {
+                editor_session = None;
                 match result {
                     Ok(Ok((target, original, edited))) => {
                         if let Err(error) = apply_edit(
@@ -301,17 +316,13 @@ async fn main() {
                 tray.regular = regular;
                 tray.stack = stack.clone();
                 tray.notifications_enabled = notifications_enabled;
-                tray.editor_busy = editor_task.is_some();
+                tray.editor_target = editor_session.as_ref().map(|session| session.target);
             })
             .await;
     }
 
-    if let Some(task) = editor_task.take() {
-        task.abort();
-        let _ = task.await;
-        if debug {
-            eprintln!("[debug] editor task cancelled during shutdown");
-        }
+    if cancel_editor(&mut editor_session).await.is_some() && debug {
+        eprintln!("[debug] editor task cancelled during shutdown");
     }
 }
 
@@ -410,11 +421,18 @@ fn replace_stack_entry_if_unchanged(
     Ok(())
 }
 
-async fn wait_for_editor(task: &mut Option<JoinHandle<EditorResult>>) -> EditorResultJoin {
-    match task {
-        Some(task) => task.await,
+async fn wait_for_editor(session: &mut Option<EditorSession>) -> EditorResultJoin {
+    match session {
+        Some(session) => (&mut session.task).await,
         None => std::future::pending().await,
     }
+}
+
+async fn cancel_editor(session: &mut Option<EditorSession>) -> Option<EditTarget> {
+    let session = session.take()?;
+    session.task.abort();
+    let _ = session.task.await;
+    Some(session.target)
 }
 
 type EditorResultJoin = Result<EditorResult, tokio::task::JoinError>;
@@ -582,5 +600,30 @@ mod tests {
             );
             assert_eq!(stack[0].value, "kept");
         }
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_editor_consumes_the_session() {
+        let task = tokio::spawn(std::future::pending());
+        let mut session = Some(EditorSession {
+            target: EditTarget::Regular,
+            task,
+        });
+        assert_eq!(cancel_editor(&mut session).await, Some(EditTarget::Regular));
+        assert!(session.is_none());
+        assert_eq!(cancel_editor(&mut session).await, None);
+    }
+
+    #[tokio::test]
+    async fn cancellation_wins_safely_when_editor_completion_is_ready() {
+        let task =
+            tokio::spawn(async { Ok((EditTarget::Primary, "original".into(), "edited".into())) });
+        tokio::task::yield_now().await;
+        let mut session = Some(EditorSession {
+            target: EditTarget::Primary,
+            task,
+        });
+        assert_eq!(cancel_editor(&mut session).await, Some(EditTarget::Primary));
+        assert!(session.is_none());
     }
 }

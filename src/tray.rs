@@ -14,6 +14,7 @@ pub(crate) enum AppEvent {
     Stack(StackAction),
     Clear(ClearTarget),
     Edit(EditTarget),
+    CancelEdit,
     ToggleNotifications,
     Exit,
 }
@@ -38,7 +39,7 @@ pub(crate) struct ClipboardTray {
     pub(crate) hide_content: bool,
     pub(crate) notifications_enabled: bool,
     pub(crate) editor_enabled: bool,
-    pub(crate) editor_busy: bool,
+    pub(crate) editor_target: Option<EditTarget>,
     pub(crate) stack_enabled: bool,
     pub(crate) max_clipboard_bytes: u64,
 }
@@ -141,11 +142,21 @@ impl ksni::Tray for ClipboardTray {
         let switch_enabled =
             any_content && is_switchable(&self.primary) && is_switchable(&self.regular);
         let mut menu = Vec::new();
-        if self.editor_busy {
+        if let Some(target) = self.editor_target {
             menu.push(
                 StandardItem {
-                    label: "Editor busy".into(),
+                    label: editing_label(target, &self.stack),
                     enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+            );
+            menu.push(
+                StandardItem {
+                    label: "Cancel edit".into(),
+                    activate: Box::new(|tray: &mut Self| {
+                        let _ = tray.event_sender.send(AppEvent::CancelEdit);
+                    }),
                     ..Default::default()
                 }
                 .into(),
@@ -157,7 +168,7 @@ impl ksni::Tray for ClipboardTray {
             menu.push(edit_item(
                 "Edit primary".into(),
                 EditTarget::Primary,
-                !self.editor_busy && has_content(&self.primary),
+                self.editor_target.is_none() && has_content(&self.primary),
             ));
         }
         menu.push(action_item(
@@ -185,7 +196,7 @@ impl ksni::Tray for ClipboardTray {
             menu.push(edit_item(
                 "Edit regular".into(),
                 EditTarget::Regular,
-                !self.editor_busy && has_content(&self.regular),
+                self.editor_target.is_none() && has_content(&self.regular),
             ));
         }
         menu.push(action_item(
@@ -235,7 +246,11 @@ impl ksni::Tray for ClipboardTray {
                                 )
                                 .replace('_', "__")
                             };
-                            edit_item(label, EditTarget::Stack(entry.id), !self.editor_busy)
+                            edit_item(
+                                label,
+                                EditTarget::Stack(entry.id),
+                                self.editor_target.is_none(),
+                            )
                         },
                     ));
                 } else if !self.hide_content {
@@ -308,6 +323,18 @@ fn is_switchable(value: &ClipboardRead) -> bool {
     matches!(value, ClipboardRead::Text(_) | ClipboardRead::Empty)
 }
 
+fn editing_label(target: EditTarget, stack: &[StackEntry]) -> String {
+    match target {
+        EditTarget::Primary => "Editing primary".into(),
+        EditTarget::Regular => "Editing regular".into(),
+        EditTarget::Stack(id) => stack
+            .iter()
+            .position(|entry| entry.id == id)
+            .map(|index| format!("Editing stacked entry {}", stack.len() - index))
+            .unwrap_or_else(|| "Editing removed stacked entry".into()),
+    }
+}
+
 fn preview(value: &ClipboardRead, hide: bool) -> String {
     match value {
         ClipboardRead::Text(value) => preview_text(value, hide),
@@ -361,7 +388,7 @@ mod tests {
                 hide_content: false,
                 notifications_enabled: false,
                 editor_enabled: true,
-                editor_busy: false,
+                editor_target: None,
                 stack_enabled: true,
                 max_clipboard_bytes: 1024,
             },
@@ -461,15 +488,38 @@ mod tests {
     }
 
     #[test]
-    fn editor_busy_state_is_shown_and_disables_every_edit_action() {
-        let (mut tray, _) = editable_tray();
-        tray.editor_busy = true;
+    fn editor_busy_state_identifies_target_and_can_be_cancelled() {
+        let (mut tray, mut receiver) = editable_tray();
+        tray.editor_target = Some(EditTarget::Primary);
         let items = ksni::Tray::menu(&tray);
         assert!(items.iter().any(|item| {
-            matches!(item, ksni::MenuItem::Standard(item) if item.label == "Editor busy" && !item.enabled)
+            matches!(item, ksni::MenuItem::Standard(item) if item.label == "Editing primary" && !item.enabled)
         }));
         assert!(items.iter().all(|item| {
             !matches!(item, ksni::MenuItem::Standard(item) if item.label.starts_with("Edit ") && item.enabled)
+        }));
+        let cancel = items
+            .into_iter()
+            .find_map(|item| match item {
+                ksni::MenuItem::Standard(item) if item.label == "Cancel edit" => Some(item),
+                _ => None,
+            })
+            .unwrap();
+        (cancel.activate)(&mut tray);
+        assert_eq!(receiver.try_recv(), Ok(AppEvent::CancelEdit));
+    }
+
+    #[test]
+    fn editor_busy_state_identifies_stack_target_without_content() {
+        let (mut tray, _) = editable_tray();
+        let oldest_id = tray.stack[0].id;
+        tray.editor_target = Some(EditTarget::Stack(oldest_id));
+        assert!(ksni::Tray::menu(&tray).iter().any(|item| {
+            matches!(item, ksni::MenuItem::Standard(item) if item.label == "Editing stacked entry 2")
+        }));
+        tray.stack.clear();
+        assert!(ksni::Tray::menu(&tray).iter().any(|item| {
+            matches!(item, ksni::MenuItem::Standard(item) if item.label == "Editing removed stacked entry")
         }));
     }
 
