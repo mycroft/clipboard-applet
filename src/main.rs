@@ -17,6 +17,7 @@ use std::time::Duration;
 use ksni::TrayMethods;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use wl_clipboard_rs::copy::ClipboardType as CopyClipboardType;
 use wl_clipboard_rs::paste::ClipboardType;
 
@@ -27,6 +28,8 @@ use config::UpdateMethod;
 use notification::{clipboard_change, send_change, settings as notification_settings};
 use stack::perform as perform_stack_action;
 use tray::{AppEvent, ClipboardTray, EditTarget, tooltip_text};
+
+type EditorResult = Result<(EditTarget, String, String), String>;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -103,6 +106,7 @@ async fn main() {
         hide_content: config.hide_content,
         notifications_enabled,
         editor_enabled: !config.editor.is_empty(),
+        editor_busy: false,
         stack_enabled: config.stack_enabled,
         max_clipboard_bytes: config.max_clipboard_bytes,
     };
@@ -132,6 +136,7 @@ async fn main() {
         eprintln!("failed to install SIGTERM handler: {error}");
         std::process::exit(1);
     });
+    let mut editor_task: Option<JoinHandle<EditorResult>> = None;
 
     loop {
         let mut check_for_change = false;
@@ -205,34 +210,50 @@ async fn main() {
                         }
                     }
                     AppEvent::Edit(target) => {
-                        let command = config.editor.clone();
-                        let max_clipboard_bytes = config.max_clipboard_bytes;
-                        let max_stack_entry_bytes = config.max_stack_entry_bytes;
-                        let mut current_stack = std::mem::take(&mut stack);
-                        let result = tokio::task::spawn_blocking(move || {
-                            let result = perform_edit(
+                        if editor_task.is_some() {
+                            eprintln!("could not edit clipboard value: an editor is already running");
+                        } else {
+                            let command = config.editor.clone();
+                            let max_clipboard_bytes = config.max_clipboard_bytes;
+                            let max_stack_entry_bytes = config.max_stack_entry_bytes;
+                            let stack_value = match target {
+                                EditTarget::Stack(index) => stack.get(index).cloned(),
+                                EditTarget::Primary | EditTarget::Regular => None,
+                            };
+                            editor_task = Some(tokio::spawn(run_editor(
                                 target,
-                                &mut current_stack,
-                                &command,
+                                stack_value,
+                                command,
                                 max_clipboard_bytes,
                                 max_stack_entry_bytes,
-                                notifications_enabled,
                                 debug,
-                            );
-                            (result, current_stack)
-                        }).await;
-                        match result {
-                            Ok((result, returned_stack)) => {
-                                stack = returned_stack;
-                                if let Err(error) = result { eprintln!("could not edit clipboard value: {error}"); }
-                            }
-                            Err(error) => eprintln!("clipboard editor stopped unexpectedly: {error}"),
+                            )));
+                            if debug { eprintln!("[debug] editor task started: target={target:?}"); }
                         }
                     }
                     AppEvent::ToggleNotifications => {
                         notifications_enabled = !notifications_enabled;
                         if debug { eprintln!("[debug] notifications toggled: enabled={notifications_enabled}"); }
                     }
+                }
+            }
+            result = wait_for_editor(&mut editor_task) => {
+                editor_task = None;
+                match result {
+                    Ok(Ok((target, original, edited))) => {
+                        if let Err(error) = apply_edit(
+                            target,
+                            original,
+                            edited,
+                            &mut stack,
+                            notifications_enabled,
+                            debug,
+                        ).await {
+                            eprintln!("could not edit clipboard value: {error}");
+                        }
+                    }
+                    Ok(Err(error)) => eprintln!("could not edit clipboard value: {error}"),
+                    Err(error) => eprintln!("clipboard editor stopped unexpectedly: {error}"),
                 }
             }
         }
@@ -277,44 +298,78 @@ async fn main() {
                 tray.regular = regular;
                 tray.stack = stack.clone();
                 tray.notifications_enabled = notifications_enabled;
+                tray.editor_busy = editor_task.is_some();
             })
             .await;
     }
+
+    if let Some(task) = editor_task.take() {
+        task.abort();
+        let _ = task.await;
+        if debug {
+            eprintln!("[debug] editor task cancelled during shutdown");
+        }
+    }
 }
 
-fn perform_edit(
+async fn run_editor(
     target: EditTarget,
-    stack: &mut [String],
-    command: &[String],
+    stack_value: Option<String>,
+    command: Vec<String>,
     max_clipboard_bytes: u64,
     max_stack_entry_bytes: u64,
-    notifications: bool,
     debug: bool,
-) -> Result<(), String> {
+) -> EditorResult {
     if debug {
         eprintln!("[debug] edit requested: target={target:?}");
     }
     let original = match target {
-        EditTarget::Primary => {
-            read(ClipboardType::Primary, max_clipboard_bytes).into_editable("primary")?
+        EditTarget::Primary | EditTarget::Regular => tokio::task::spawn_blocking(move || {
+            let (clipboard, name) = match target {
+                EditTarget::Primary => (ClipboardType::Primary, "primary"),
+                EditTarget::Regular => (ClipboardType::Regular, "regular"),
+                EditTarget::Stack(_) => unreachable!(),
+            };
+            read(clipboard, max_clipboard_bytes).into_editable(name)
+        })
+        .await
+        .map_err(|error| format!("clipboard reader stopped unexpectedly: {error}"))??,
+        EditTarget::Stack(_) => {
+            stack_value.ok_or_else(|| "stacked entry no longer exists".to_string())?
         }
-        EditTarget::Regular => {
-            read(ClipboardType::Regular, max_clipboard_bytes).into_editable("regular")?
-        }
-        EditTarget::Stack(index) => stack
-            .get(index)
-            .cloned()
-            .ok_or_else(|| "stacked entry no longer exists".to_string())?,
     };
     let max_edited_bytes = match target {
         EditTarget::Primary | EditTarget::Regular => max_clipboard_bytes,
         EditTarget::Stack(_) => max_stack_entry_bytes,
     };
-    let edited = editor::edit(command, &original, max_edited_bytes, debug)?;
+    let edited = editor::edit(&command, &original, max_edited_bytes, debug).await?;
+    Ok((target, original, edited))
+}
+
+async fn apply_edit(
+    target: EditTarget,
+    original: String,
+    edited: String,
+    stack: &mut [String],
+    notifications: bool,
+    debug: bool,
+) -> Result<(), String> {
     match target {
-        EditTarget::Primary => write(CopyClipboardType::Primary, edited, debug)?,
-        EditTarget::Regular => write(CopyClipboardType::Regular, edited, debug)?,
-        EditTarget::Stack(index) => replace_stack_entry(stack, index, edited)?,
+        EditTarget::Primary | EditTarget::Regular => {
+            tokio::task::spawn_blocking(move || {
+                let clipboard = match target {
+                    EditTarget::Primary => CopyClipboardType::Primary,
+                    EditTarget::Regular => CopyClipboardType::Regular,
+                    EditTarget::Stack(_) => unreachable!(),
+                };
+                write(clipboard, edited, debug)
+            })
+            .await
+            .map_err(|error| format!("clipboard writer stopped unexpectedly: {error}"))??;
+        }
+        EditTarget::Stack(index) => {
+            replace_stack_entry_if_unchanged(stack, index, &original, edited)?;
+        }
     }
     let sent =
         notification::send_if_enabled("Clipboard value edited", "clipboard edit", notifications);
@@ -324,13 +379,30 @@ fn perform_edit(
     Ok(())
 }
 
-fn replace_stack_entry(stack: &mut [String], index: usize, value: String) -> Result<(), String> {
+fn replace_stack_entry_if_unchanged(
+    stack: &mut [String],
+    index: usize,
+    original: &str,
+    value: String,
+) -> Result<(), String> {
     let entry = stack
         .get_mut(index)
         .ok_or_else(|| "stacked entry no longer exists".to_string())?;
+    if entry != original {
+        return Err("stacked entry changed while it was being edited".into());
+    }
     *entry = value;
     Ok(())
 }
+
+async fn wait_for_editor(task: &mut Option<JoinHandle<EditorResult>>) -> EditorResultJoin {
+    match task {
+        Some(task) => task.await,
+        None => std::future::pending().await,
+    }
+}
+
+type EditorResultJoin = Result<EditorResult, tokio::task::JoinError>;
 
 fn report_read_issue(selection: &str, value: &ClipboardRead) {
     match value {
@@ -442,10 +514,13 @@ mod tests {
     }
 
     #[test]
-    fn stack_edit_replaces_in_place() {
+    fn stack_edit_replaces_only_an_unchanged_entry() {
         let mut stack = vec!["oldest".into(), "target".into(), "newest".into()];
-        replace_stack_entry(&mut stack, 1, "edited".into()).unwrap();
+        replace_stack_entry_if_unchanged(&mut stack, 1, "target", "edited".into()).unwrap();
         assert_eq!(stack, ["oldest", "edited", "newest"]);
-        assert!(replace_stack_entry(&mut stack, 3, "missing".into()).is_err());
+        assert!(replace_stack_entry_if_unchanged(&mut stack, 1, "target", "stale".into()).is_err());
+        assert!(
+            replace_stack_entry_if_unchanged(&mut stack, 3, "missing", "missing".into()).is_err()
+        );
     }
 }

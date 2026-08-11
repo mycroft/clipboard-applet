@@ -1,23 +1,33 @@
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(test)]
 use std::path::Path;
-use std::process::Command;
 
-pub(crate) fn edit(
+pub(crate) async fn edit(
     command: &[String],
     original: &str,
     max_bytes: u64,
     debug: bool,
 ) -> Result<String, String> {
-    edit_with(command, original, max_bytes, debug, |command, path| {
-        let status = Command::new(&command[0])
-            .args(&command[1..])
-            .arg(path)
-            .status()
-            .map_err(|error| format!("could not launch editor: {error}"))?;
-        Ok(status.success())
-    })
+    validate_command(command)?;
+    let mut file = prepare_file(original)?;
+    log_started(original, debug);
+    let mut child = tokio::process::Command::new(&command[0])
+        .args(&command[1..])
+        .arg(file.path())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| format!("could not launch editor: {error}"))?;
+    let status = child
+        .wait()
+        .await
+        .map_err(|error| format!("could not wait for editor: {error}"))?;
+    if !status.success() {
+        return Err("editor exited unsuccessfully; original value preserved".into());
+    }
+    read_edited_value(&mut file, max_bytes, debug)
 }
 
+#[cfg(test)]
 fn edit_with<F>(
     command: &[String],
     original: &str,
@@ -28,24 +38,47 @@ fn edit_with<F>(
 where
     F: FnOnce(&[String], &Path) -> Result<bool, String>,
 {
-    if command.is_empty() {
-        return Err("no editor command is configured".into());
+    validate_command(command)?;
+    let mut file = prepare_file(original)?;
+    log_started(original, debug);
+    if !run(command, file.path())? {
+        return Err("editor exited unsuccessfully; original value preserved".into());
     }
+    read_edited_value(&mut file, max_bytes, debug)
+}
+
+fn validate_command(command: &[String]) -> Result<(), String> {
+    if command.is_empty() {
+        Err("no editor command is configured".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn prepare_file(original: &str) -> Result<tempfile::NamedTempFile, String> {
     let mut file = tempfile::NamedTempFile::new()
         .map_err(|error| format!("could not create private edit file: {error}"))?;
     file.write_all(original.as_bytes())
         .and_then(|()| file.write_all(b"\n"))
         .and_then(|()| file.flush())
         .map_err(|error| format!("could not prepare edit file: {error}"))?;
+    Ok(file)
+}
+
+fn log_started(original: &str, debug: bool) {
     if debug {
         eprintln!(
             "[debug] editor started: original_length={} chars",
             original.chars().count()
         );
     }
-    if !run(command, file.path())? {
-        return Err("editor exited unsuccessfully; original value preserved".into());
-    }
+}
+
+fn read_edited_value(
+    file: &mut tempfile::NamedTempFile,
+    max_bytes: u64,
+    debug: bool,
+) -> Result<String, String> {
     let length = file
         .as_file()
         .metadata()
@@ -170,5 +203,51 @@ mod tests {
             });
             assert_eq!(result.is_ok(), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn asynchronous_editor_returns_replacement_and_failure() {
+        let edited = edit(
+            &[
+                "sh".into(),
+                "-c".into(),
+                "printf edited > \"$1\"".into(),
+                "editor".into(),
+            ],
+            "original",
+            LIMIT,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(edited, "edited");
+
+        assert!(
+            edit(
+                &["sh".into(), "-c".into(), "exit 1".into()],
+                "original",
+                LIMIT,
+                false,
+            )
+            .await
+            .unwrap_err()
+            .contains("original value preserved")
+        );
+    }
+
+    #[tokio::test]
+    async fn editor_task_can_be_cancelled_during_shutdown() {
+        let task = tokio::spawn(async {
+            edit(
+                &["sh".into(), "-c".into(), "exec sleep 60".into()],
+                "original",
+                LIMIT,
+                false,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
     }
 }

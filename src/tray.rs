@@ -38,6 +38,7 @@ pub(crate) struct ClipboardTray {
     pub(crate) hide_content: bool,
     pub(crate) notifications_enabled: bool,
     pub(crate) editor_enabled: bool,
+    pub(crate) editor_busy: bool,
     pub(crate) stack_enabled: bool,
     pub(crate) max_clipboard_bytes: u64,
 }
@@ -139,12 +140,24 @@ impl ksni::Tray for ClipboardTray {
         let any_content = has_content(&self.primary) || has_content(&self.regular);
         let switch_enabled =
             any_content && is_switchable(&self.primary) && is_switchable(&self.regular);
-        let mut menu = vec![preview_item("Primary", &self.primary)];
+        let mut menu = Vec::new();
+        if self.editor_busy {
+            menu.push(
+                StandardItem {
+                    label: "Editor busy".into(),
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+            );
+            menu.push(separator_item());
+        }
+        menu.push(preview_item("Primary", &self.primary));
         if self.editor_enabled {
             menu.push(edit_item(
                 "Edit primary".into(),
                 EditTarget::Primary,
-                has_content(&self.primary),
+                !self.editor_busy && has_content(&self.primary),
             ));
         }
         menu.push(action_item(
@@ -172,7 +185,7 @@ impl ksni::Tray for ClipboardTray {
             menu.push(edit_item(
                 "Edit regular".into(),
                 EditTarget::Regular,
-                has_content(&self.regular),
+                !self.editor_busy && has_content(&self.regular),
             ));
         }
         menu.push(action_item(
@@ -223,7 +236,7 @@ impl ksni::Tray for ClipboardTray {
                                 )
                                 .replace('_', "__")
                             };
-                            edit_item(label, EditTarget::Stack(stack_index), true)
+                            edit_item(label, EditTarget::Stack(stack_index), !self.editor_busy)
                         },
                     ));
                 } else if !self.hide_content {
@@ -346,6 +359,7 @@ mod tests {
                 hide_content: false,
                 notifications_enabled: false,
                 editor_enabled: true,
+                editor_busy: false,
                 stack_enabled: true,
                 max_clipboard_bytes: 1024,
             },
@@ -440,6 +454,19 @@ mod tests {
             (item.activate)(&mut tray);
             assert_eq!(receiver.try_recv(), Ok(AppEvent::Edit(expected)));
         }
+    }
+
+    #[test]
+    fn editor_busy_state_is_shown_and_disables_every_edit_action() {
+        let (mut tray, _) = editable_tray();
+        tray.editor_busy = true;
+        let items = ksni::Tray::menu(&tray);
+        assert!(items.iter().any(|item| {
+            matches!(item, ksni::MenuItem::Standard(item) if item.label == "Editor busy" && !item.enabled)
+        }));
+        assert!(items.iter().all(|item| {
+            !matches!(item, ksni::MenuItem::Standard(item) if item.label.starts_with("Edit ") && item.enabled)
+        }));
     }
 
     #[test]
