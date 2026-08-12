@@ -136,6 +136,8 @@ Edited files larger than 1 MiB are rejected, and the original value is preserved
 
 `max_clipboard_bytes` limits each text value read from Wayland. `max_stack_entry_bytes` limits each stacked or edited stack value. Both limits are measured in UTF-8 bytes and default to 1 MiB. Oversized values are rejected rather than truncated, leaving existing destinations and stack entries unchanged.
 
+A text MIME type does not promise UTF-8, so a selection offered as `text/plain;charset=ISO-8859-1` may not decode. Such a selection is shown as `(non-text)` and its actions are disabled, rather than being copied with replacement characters substituted for the bytes that did not decode.
+
 Only one applet instance can run in a desktop session. A second process exits with an explanatory error. The advisory lock is released automatically when the running process exits or crashes, so a leftover lock file does not block future starts.
 
 ## Tray controls

@@ -262,14 +262,14 @@ fn read_text(reader: impl Read, max_bytes: u64) -> ClipboardRead {
         .read_to_end(&mut bytes)
     {
         Ok(_) if bytes.len() as u64 > max_bytes => ClipboardRead::Oversized { limit: max_bytes },
-        Ok(_) => {
-            let value = String::from_utf8_lossy(&bytes).into_owned();
-            if value.len() as u64 > max_bytes {
-                ClipboardRead::Oversized { limit: max_bytes }
-            } else {
-                ClipboardRead::Text(value)
-            }
-        }
+        // A text MIME type does not promise UTF-8; `text/plain;charset=ISO-8859-1` is
+        // offered as text too. Substituting replacement characters would let COPY and
+        // SWITCH write the mangled text back over the original, so refuse the selection
+        // instead. Truncation cannot cause this: anything longer was already oversized.
+        Ok(_) => match String::from_utf8(bytes) {
+            Ok(value) => ClipboardRead::Text(value),
+            Err(_) => ClipboardRead::NonText,
+        },
         Err(error) => ClipboardRead::Error(format!("could not receive contents: {error}")),
     }
 }
@@ -900,9 +900,42 @@ mod tests {
             read_text("12345".as_bytes(), 4),
             ClipboardRead::Oversized { limit: 4 }
         );
+    }
+
+    #[test]
+    fn invalid_utf8_is_refused_rather_than_repaired() {
+        // "café" as a latin-1 `text/plain` selection would serve these bytes.
         assert_eq!(
-            read_text([0xff].as_slice(), 1),
-            ClipboardRead::Oversized { limit: 1 }
+            read_text(b"caf\xe9".as_slice(), 1024),
+            ClipboardRead::NonText
+        );
+        assert_eq!(read_text([0xff].as_slice(), 1024), ClipboardRead::NonText);
+        assert_eq!(
+            read_text("café🙂".as_bytes(), 1024),
+            ClipboardRead::Text("café🙂".into())
+        );
+    }
+
+    #[test]
+    fn a_latin1_selection_is_never_written_back() {
+        let mut writes = Vec::new();
+        assert!(
+            copy_read_to(
+                "COPY",
+                "source",
+                read_text(b"caf\xe9".as_slice(), 1024),
+                CopyClipboardType::Primary,
+                false,
+                |clipboard, value, _| {
+                    writes.push((clipboard, value));
+                    Ok(())
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            writes.is_empty(),
+            "wrote replacement characters: {writes:?}"
         );
     }
 }
