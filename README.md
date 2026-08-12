@@ -141,7 +141,7 @@ Only one applet instance can run in a desktop session. A second process exits wi
 ## Tray controls
 
 - Left and middle click perform their configured actions.
-- Right click opens the action menu.
+- Right click opens the action menu. It shows the values from the most recent refresh and requests a new read that repaints the menu when it lands, so an unresponsive clipboard owner cannot freeze the applet.
 - Copy, Stack, Clear, Switch, and Reset entries are disabled when their required clipboard content is empty.
 - Edit actions are enabled for text selections and stack entries when `editor` is configured.
 - Stack entries are listed newest-first unless `hide_content` is enabled. Pop can target primary, regular, or both; an entry is removed only after the write succeeds.

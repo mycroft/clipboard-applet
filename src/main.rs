@@ -131,7 +131,6 @@ async fn main() {
         editor_enabled: !config.editor.is_empty(),
         editor_target: None,
         stack_enabled: config.stack_enabled,
-        read_limits,
     };
     let handle = tray.spawn().await.unwrap_or_else(|error| {
         eprintln!("failed to register tray icon: {error}");
@@ -263,6 +262,12 @@ async fn main() {
                         } else if debug {
                             eprintln!("[debug] editor cancellation ignored: no active editor");
                         }
+                    }
+                    AppEvent::Refresh => {
+                        // The clipboards are re-read below on every iteration, so the menu
+                        // only needs to wake the loop. No change notification is sent: the
+                        // user opening the menu is not a clipboard change.
+                        if debug { eprintln!("[debug] refresh requested: source=Menu"); }
                     }
                     AppEvent::ToggleNotifications => {
                         notifications_enabled = !notifications_enabled;

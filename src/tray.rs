@@ -1,9 +1,7 @@
 use ksni::ToolTip;
 use tokio::sync::mpsc;
 
-use crate::clipboard::{
-    ActionRequest, ActionSource, ClearTarget, ClipboardAction, ClipboardRead, ReadLimits, read_both,
-};
+use crate::clipboard::{ActionRequest, ActionSource, ClearTarget, ClipboardAction, ClipboardRead};
 use crate::stack::{StackAction, StackEntry};
 
 const PREVIEW_CHARS: usize = 40;
@@ -16,6 +14,7 @@ pub(crate) enum AppEvent {
     Edit(EditTarget),
     CancelEdit,
     ToggleNotifications,
+    Refresh,
     Exit,
 }
 
@@ -41,7 +40,6 @@ pub(crate) struct ClipboardTray {
     pub(crate) editor_enabled: bool,
     pub(crate) editor_target: Option<EditTarget>,
     pub(crate) stack_enabled: bool,
-    pub(crate) read_limits: ReadLimits,
 }
 
 impl ksni::Tray for ClipboardTray {
@@ -299,7 +297,11 @@ impl ksni::Tray for ClipboardTray {
         menu
     }
     fn menu_about_to_show(&mut self) {
-        (self.primary, self.regular) = read_both(self.read_limits);
+        // Reading the clipboard here would block the ksni service task, which shares the
+        // single-threaded runtime with the main event loop and holds the lock that tray
+        // updates need. Ask the loop to refresh instead: the menu opens with the values
+        // from the last refresh and repaints once the new read lands.
+        let _ = self.event_sender.send(AppEvent::Refresh);
     }
 }
 
@@ -390,10 +392,6 @@ mod tests {
                 editor_enabled: true,
                 editor_target: None,
                 stack_enabled: true,
-                read_limits: ReadLimits {
-                    max_bytes: 1024,
-                    timeout: std::time::Duration::from_secs(5),
-                },
             },
             event_receiver,
         )
@@ -540,6 +538,17 @@ mod tests {
         assert!(labels.iter().all(|label| !label.starts_with("Edit")));
         assert!(labels.iter().any(|label| label == "1: newest"));
         assert!(labels.iter().any(|label| label == "2: oldest"));
+    }
+
+    #[test]
+    fn opening_the_menu_requests_a_refresh_instead_of_reading() {
+        let (mut tray, mut receiver) = editable_tray();
+        ksni::Tray::menu_about_to_show(&mut tray);
+        assert_eq!(receiver.try_recv(), Ok(AppEvent::Refresh));
+        // A read here would both block the service task and, with no compositor
+        // reachable, replace the shown values with an error.
+        assert_eq!(tray.primary, ClipboardRead::Text("primary".into()));
+        assert_eq!(tray.regular, ClipboardRead::Text("regular".into()));
     }
 
     #[test]
