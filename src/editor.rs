@@ -1,5 +1,6 @@
-use std::io::{Read, Seek, SeekFrom, Write};
-#[cfg(test)]
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 pub(crate) async fn edit(
@@ -9,7 +10,7 @@ pub(crate) async fn edit(
     debug: bool,
 ) -> Result<String, String> {
     validate_command(command)?;
-    let mut file = prepare_file(original)?;
+    let file = prepare_file(original)?;
     log_started(original, debug);
     let mut child = tokio::process::Command::new(&command[0])
         .args(&command[1..])
@@ -24,7 +25,7 @@ pub(crate) async fn edit(
     if !status.success() {
         return Err("editor exited unsuccessfully; original value preserved".into());
     }
-    read_edited_value(&mut file, max_bytes, debug)
+    read_edited_value(file.path(), max_bytes, debug)
 }
 
 #[cfg(test)]
@@ -39,12 +40,12 @@ where
     F: FnOnce(&[String], &Path) -> Result<bool, String>,
 {
     validate_command(command)?;
-    let mut file = prepare_file(original)?;
+    let file = prepare_file(original)?;
     log_started(original, debug);
     if !run(command, file.path())? {
         return Err("editor exited unsuccessfully; original value preserved".into());
     }
-    read_edited_value(&mut file, max_bytes, debug)
+    read_edited_value(file.path(), max_bytes, debug)
 }
 
 fn validate_command(command: &[String]) -> Result<(), String> {
@@ -74,13 +75,19 @@ fn log_started(original: &str, debug: bool) {
     }
 }
 
-fn read_edited_value(
-    file: &mut tempfile::NamedTempFile,
-    max_bytes: u64,
-    debug: bool,
-) -> Result<String, String> {
+fn read_edited_value(path: &Path, max_bytes: u64, debug: bool) -> Result<String, String> {
+    // Editors commonly save by writing a replacement file and renaming it over the
+    // original, which leaves the prepared descriptor pointing at the old inode. Reopen
+    // by path so those edits are not silently discarded, refusing to follow a symlink
+    // because the path is no longer guaranteed to name the file we created.
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| {
+            format!("could not reopen edited value: {error}; original value preserved")
+        })?;
     let length = file
-        .as_file()
         .metadata()
         .map_err(|error| format!("could not inspect edited value: {error}"))?
         .len();
@@ -89,11 +96,8 @@ fn read_edited_value(
             "edited value is too large ({length} bytes; limit is {max_bytes})"
         ));
     }
-    file.as_file_mut()
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| format!("could not rewind edited value: {error}"))?;
     let mut bytes = Vec::with_capacity(length as usize);
-    file.as_file_mut()
+    file.take(max_bytes.saturating_add(2))
         .read_to_end(&mut bytes)
         .map_err(|error| format!("could not read edited value: {error}"))?;
     if bytes.last() == Some(&b'\n') {
@@ -130,6 +134,42 @@ mod tests {
         })
         .unwrap();
         assert_eq!(value, "edited");
+    }
+
+    #[test]
+    fn edit_saved_by_rename_is_not_discarded() {
+        let value = edit_with(&["editor".into()], "original", LIMIT, false, |_, path| {
+            let replacement = path.with_extension("replacement");
+            std::fs::write(&replacement, "edited\n").map_err(|error| error.to_string())?;
+            std::fs::rename(&replacement, path).map_err(|error| error.to_string())?;
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(value, "edited");
+    }
+
+    #[test]
+    fn removed_edit_file_preserves_the_original() {
+        let result = edit_with(&["editor".into()], "original", LIMIT, false, |_, path| {
+            std::fs::remove_file(path).map_err(|error| error.to_string())?;
+            Ok(true)
+        });
+        assert!(result.unwrap_err().contains("original value preserved"));
+    }
+
+    #[test]
+    fn symlinked_edit_file_is_refused() {
+        let mut target: Option<std::path::PathBuf> = None;
+        let result = edit_with(&["editor".into()], "original", LIMIT, false, |_, path| {
+            let link_target = path.with_extension("target");
+            std::fs::write(&link_target, "attacker\n").map_err(|error| error.to_string())?;
+            std::fs::remove_file(path).map_err(|error| error.to_string())?;
+            std::os::unix::fs::symlink(&link_target, path).map_err(|error| error.to_string())?;
+            target = Some(link_target);
+            Ok(true)
+        });
+        assert!(result.unwrap_err().contains("original value preserved"));
+        std::fs::remove_file(target.unwrap()).unwrap();
     }
 
     #[test]
@@ -233,6 +273,24 @@ mod tests {
             .unwrap_err()
             .contains("original value preserved")
         );
+    }
+
+    #[tokio::test]
+    async fn asynchronous_editor_saving_by_rename_is_not_discarded() {
+        let edited = edit(
+            &[
+                "sh".into(),
+                "-c".into(),
+                "printf edited > \"$1.new\" && mv \"$1.new\" \"$1\"".into(),
+                "editor".into(),
+            ],
+            "original",
+            LIMIT,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(edited, "edited");
     }
 
     #[tokio::test]
