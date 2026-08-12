@@ -11,6 +11,12 @@ update_method = "EVENTS"
 # milliseconds. Must be greater than zero.
 polling_period_ms = 1000
 
+# How long to wait for the application that owns a selection to deliver its
+# content, in milliseconds (1-600000). The owner serves the clipboard pipe, so
+# an unresponsive one would otherwise stall the applet indefinitely. A read that
+# runs out of time is reported as unavailable and changes no clipboard.
+read_timeout_ms = 5000
+
 # Hide clipboard text in the tooltip and right-click menu. When enabled,
 # only the number of characters in each clipboard is shown.
 hide_content = false

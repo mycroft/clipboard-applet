@@ -22,7 +22,7 @@ use wl_clipboard_rs::copy::ClipboardType as CopyClipboardType;
 use wl_clipboard_rs::paste::ClipboardType;
 
 use cli::{CliAction, parse_args, print_help};
-use clipboard::{ClipboardRead, perform_action, perform_clear, read, read_both, write};
+use clipboard::{ClipboardRead, ReadLimits, perform_action, perform_clear, read, read_both, write};
 use clipboard_monitor::MonitorEvent;
 use config::UpdateMethod;
 use notification::{clipboard_change, send_change, settings as notification_settings};
@@ -82,6 +82,10 @@ async fn main() {
         std::process::exit(1);
     });
     let polling_period = Duration::from_millis(config.polling_period_ms);
+    let read_limits = ReadLimits {
+        max_bytes: config.max_clipboard_bytes,
+        timeout: Duration::from_millis(config.read_timeout_ms),
+    };
     let (mut notifications_enabled, notify_on_change) =
         notification_settings(&config, with_notifications);
     if debug {
@@ -90,10 +94,11 @@ async fn main() {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "XDG default".into());
         eprintln!(
-            "[debug] started: config={}, update_method={}, polling_period_ms={}, icon_name={}, stack_size={}, max_clipboard_bytes={}, max_stack_entry_bytes={}, left_click={}, middle_click={}, notifications={}, notify_on_change={}",
+            "[debug] started: config={}, update_method={}, polling_period_ms={}, read_timeout_ms={}, icon_name={}, stack_size={}, max_clipboard_bytes={}, max_stack_entry_bytes={}, left_click={}, middle_click={}, notifications={}, notify_on_change={}",
             config_name,
             config.update_method.name(),
             config.polling_period_ms,
+            config.read_timeout_ms,
             config.icon_name,
             config.stack_size,
             config.max_clipboard_bytes,
@@ -126,7 +131,7 @@ async fn main() {
         editor_enabled: !config.editor.is_empty(),
         editor_target: None,
         stack_enabled: config.stack_enabled,
-        max_clipboard_bytes: config.max_clipboard_bytes,
+        read_limits,
     };
     let handle = tray.spawn().await.unwrap_or_else(|error| {
         eprintln!("failed to register tray icon: {error}");
@@ -186,8 +191,7 @@ async fn main() {
                         if debug {
                             eprintln!("[debug] action requested: action={}, source={:?}", request.action.name(), request.source);
                         }
-                        let max_bytes = config.max_clipboard_bytes;
-                        let result = tokio::task::spawn_blocking(move || perform_action(request.action, max_bytes, notifications_enabled, debug)).await;
+                        let result = tokio::task::spawn_blocking(move || perform_action(request.action, read_limits, notifications_enabled, debug)).await;
                         match result {
                             Ok(Ok(())) if debug => eprintln!("[debug] action completed: {}", request.action.name()),
                             Ok(Ok(())) => {}
@@ -198,14 +202,13 @@ async fn main() {
                     AppEvent::Stack(action) => {
                         let mut current_stack = std::mem::take(&mut stack);
                         let capacity = config.stack_size;
-                        let max_clipboard_bytes = config.max_clipboard_bytes;
                         let max_entry_bytes = config.max_stack_entry_bytes;
                         let result = tokio::task::spawn_blocking(move || {
                             let result = perform_stack_action(
                                 action,
                                 &mut current_stack,
                                 capacity,
-                                max_clipboard_bytes,
+                                read_limits,
                                 max_entry_bytes,
                                 notifications_enabled,
                                 debug,
@@ -232,7 +235,6 @@ async fn main() {
                             eprintln!("could not edit clipboard value: an editor is already running");
                         } else {
                             let command = config.editor.clone();
-                            let max_clipboard_bytes = config.max_clipboard_bytes;
                             let max_stack_entry_bytes = config.max_stack_entry_bytes;
                             let stack_value = match target {
                                 EditTarget::Stack(id) => stack
@@ -247,7 +249,7 @@ async fn main() {
                                     target,
                                     stack_value,
                                     command,
-                                    max_clipboard_bytes,
+                                    read_limits,
                                     max_stack_entry_bytes,
                                     debug,
                                 )),
@@ -289,22 +291,18 @@ async fn main() {
             }
         }
 
-        let (primary, regular) = match tokio::task::spawn_blocking({
-            let max_bytes = config.max_clipboard_bytes;
-            move || read_both(max_bytes)
-        })
-        .await
-        {
-            Ok(clipboards) => clipboards,
-            Err(error) => {
-                eprintln!("clipboard reader stopped unexpectedly: {error}");
-                let error = error.to_string();
-                (
-                    ClipboardRead::Error(error.clone()),
-                    ClipboardRead::Error(error),
-                )
-            }
-        };
+        let (primary, regular) =
+            match tokio::task::spawn_blocking(move || read_both(read_limits)).await {
+                Ok(clipboards) => clipboards,
+                Err(error) => {
+                    eprintln!("clipboard reader stopped unexpectedly: {error}");
+                    let error = error.to_string();
+                    (
+                        ClipboardRead::Error(error.clone()),
+                        ClipboardRead::Error(error),
+                    )
+                }
+            };
         report_read_transition("primary", &primary, &mut read_issues.0);
         report_read_transition("regular", &regular, &mut read_issues.1);
         let current_clipboards = (primary.observation(), regular.observation());
@@ -343,7 +341,7 @@ async fn run_editor(
     target: EditTarget,
     stack_value: Option<String>,
     command: Vec<String>,
-    max_clipboard_bytes: u64,
+    read_limits: ReadLimits,
     max_stack_entry_bytes: u64,
     debug: bool,
 ) -> EditorResult {
@@ -357,7 +355,7 @@ async fn run_editor(
                 EditTarget::Regular => (ClipboardType::Regular, "regular"),
                 EditTarget::Stack(_) => unreachable!(),
             };
-            read(clipboard, max_clipboard_bytes).into_editable(name)
+            read(clipboard, read_limits).into_editable(name)
         })
         .await
         .map_err(|error| format!("clipboard reader stopped unexpectedly: {error}"))??,
@@ -366,7 +364,7 @@ async fn run_editor(
         }
     };
     let max_edited_bytes = match target {
-        EditTarget::Primary | EditTarget::Regular => max_clipboard_bytes,
+        EditTarget::Primary | EditTarget::Regular => read_limits.max_bytes,
         EditTarget::Stack(_) => max_stack_entry_bytes,
     };
     let edited = editor::edit(&command, &original, max_edited_bytes, debug).await?;

@@ -4,7 +4,7 @@ use wl_clipboard_rs::copy::ClipboardType as CopyClipboardType;
 use wl_clipboard_rs::paste::ClipboardType;
 
 use crate::clipboard::{
-    ClipboardRead, length, read, try_read_both, write, write_both_with_rollback,
+    ClipboardRead, ReadLimits, length, read, try_read_both, write, write_both_with_rollback,
 };
 use crate::notification;
 
@@ -37,7 +37,7 @@ pub(crate) fn perform(
     action: StackAction,
     stack: &mut Vec<StackEntry>,
     capacity: usize,
-    max_clipboard_bytes: u64,
+    limits: ReadLimits,
     max_entry_bytes: u64,
     notifications: bool,
     debug: bool,
@@ -49,7 +49,7 @@ pub(crate) fn perform(
             } else {
                 ClipboardType::Regular
             };
-            let source = read(clipboard, max_clipboard_bytes);
+            let source = read(clipboard, limits);
             if debug {
                 eprintln!(
                     "[debug] stack push: source={clipboard:?}, state={}, length={} chars",
@@ -83,7 +83,7 @@ pub(crate) fn perform(
                 .last()
                 .map(|entry| entry.value.clone())
                 .ok_or_else(|| "clipboard stack is empty".to_string())?;
-            validate_clipboard_size(&value, max_clipboard_bytes)?;
+            validate_clipboard_size(&value, limits.max_bytes)?;
             let clipboard = if action == StackAction::PopPrimary {
                 CopyClipboardType::Primary
             } else {
@@ -101,8 +101,8 @@ pub(crate) fn perform(
         StackAction::PopBoth => pop_to_both(
             stack,
             debug,
-            max_clipboard_bytes,
-            || try_read_both(max_clipboard_bytes),
+            limits.max_bytes,
+            || try_read_both(limits),
             write,
         )?,
     }

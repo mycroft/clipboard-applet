@@ -89,6 +89,7 @@ Default configuration:
 ```toml
 update_method = "EVENTS"
 polling_period_ms = 1000
+read_timeout_ms = 5000
 hide_content = false
 notifications = false
 notify_on_change = false
@@ -118,6 +119,8 @@ Set `notify_on_change = true` to notify when the primary or regular clipboard va
 `--with-notifications true` enables action notifications only, `false` disables all notifications, and `all` enables action and clipboard-change notifications. When the option is omitted, `notifications` and `notify_on_change` are read from the configuration file. The tray menu remains a runtime master toggle.
 
 `update_method` accepts `EVENTS` or `POLLING`. `EVENTS` is the default and refreshes only when Wayland reports a primary or regular selection change. If event monitoring is unavailable or disconnects, the applet falls back to `POLLING` and uses `polling_period_ms`. `POLLING` always reads both clipboards at that interval. At idle, `EVENTS` schedules no clipboard polling wakeups; `POLLING` schedules one refresh per configured period.
+
+`read_timeout_ms` bounds how long a single selection read waits, between 1 and 600000 milliseconds. Clipboard content is delivered by the application that owns the selection, so an unresponsive owner would otherwise stall the applet indefinitely. A read that runs out of time is reported as unavailable, exactly like any other failed read, and no clipboard or stack entry is changed. Each selection gets its own budget, so refreshing both can take up to twice this value.
 
 `icon_name` is a Freedesktop icon-theme name resolved by the desktop, not a Unicode character or image path.
 

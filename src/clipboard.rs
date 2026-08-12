@@ -1,4 +1,6 @@
-use std::io::Read;
+use std::io::{self, Read};
+use std::os::fd::{AsRawFd, RawFd};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use wl_clipboard_rs::copy::{
@@ -46,6 +48,94 @@ pub(crate) struct ActionRequest {
 pub(crate) enum ClearTarget {
     Primary,
     Regular,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReadLimits {
+    pub(crate) max_bytes: u64,
+    pub(crate) timeout: Duration,
+}
+
+/// Bounds a blocking read by a deadline.
+///
+/// The clipboard pipe is served by whichever application owns the selection, so an
+/// unresponsive owner would otherwise stall the read — and the task awaiting it —
+/// forever. Wrapping the future in a timeout cannot help, because that abandons the
+/// future while the blocking read keeps the worker; the deadline has to be enforced
+/// on the descriptor itself.
+struct DeadlineReader<R> {
+    reader: R,
+    timeout: Duration,
+    deadline: Instant,
+}
+
+impl<R: AsRawFd> DeadlineReader<R> {
+    fn new(reader: R, timeout: Duration) -> io::Result<Self> {
+        set_non_blocking(reader.as_raw_fd())?;
+        Ok(Self {
+            reader,
+            timeout,
+            deadline: Instant::now() + timeout,
+        })
+    }
+
+    fn timed_out(&self) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("timed out after {} ms", self.timeout.as_millis()),
+        )
+    }
+}
+
+impl<R: Read + AsRawFd> Read for DeadlineReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let remaining = self.deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(self.timed_out());
+            }
+            let mut descriptor = libc::pollfd {
+                fd: self.reader.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let milliseconds = remaining.as_millis().min(i32::MAX as u128) as i32;
+            // SAFETY: `descriptor` holds one initialized descriptor that `reader` keeps
+            // open across the call, and `poll` does not retain the pointer.
+            let ready = unsafe { libc::poll(&mut descriptor, 1, milliseconds) };
+            if ready == -1 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if ready == 0 {
+                return Err(self.timed_out());
+            }
+            match self.reader.read(buffer) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) => {}
+                result => return result,
+            }
+        }
+    }
+}
+
+fn set_non_blocking(descriptor: RawFd) -> io::Result<()> {
+    // SAFETY: `descriptor` is borrowed from a live reader and `fcntl` does not retain it.
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: as above.
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -133,8 +223,8 @@ impl ClipboardRead {
     }
 }
 
-pub(crate) fn read_both(max_bytes: u64) -> (ClipboardRead, ClipboardRead) {
-    read_both_with(|clipboard| read(clipboard, max_bytes))
+pub(crate) fn read_both(limits: ReadLimits) -> (ClipboardRead, ClipboardRead) {
+    read_both_with(|clipboard| read(clipboard, limits))
 }
 
 fn read_both_with<F>(mut read: F) -> (ClipboardRead, ClipboardRead)
@@ -144,12 +234,14 @@ where
     (read(ClipboardType::Primary), read(ClipboardType::Regular))
 }
 
-pub(crate) fn try_read_both(max_bytes: u64) -> Result<(Option<String>, Option<String>), String> {
-    let (primary, regular) = read_both(max_bytes);
+pub(crate) fn try_read_both(
+    limits: ReadLimits,
+) -> Result<(Option<String>, Option<String>), String> {
+    let (primary, regular) = read_both(limits);
     Ok((primary.into_display()?, regular.into_display()?))
 }
 
-pub(crate) fn read(clipboard: ClipboardType, max_bytes: u64) -> ClipboardRead {
+pub(crate) fn read(clipboard: ClipboardType, limits: ReadLimits) -> ClipboardRead {
     let (pipe, _) = match get_contents(clipboard, Seat::Unspecified, MimeType::Text) {
         Ok(contents) => contents,
         Err(Error::ClipboardEmpty) => return ClipboardRead::Empty,
@@ -157,7 +249,10 @@ pub(crate) fn read(clipboard: ClipboardType, max_bytes: u64) -> ClipboardRead {
         Err(Error::PrimarySelectionUnsupported) => return ClipboardRead::Unsupported,
         Err(error) => return ClipboardRead::Error(error.to_string()),
     };
-    read_text(pipe, max_bytes)
+    match DeadlineReader::new(pipe, limits.timeout) {
+        Ok(reader) => read_text(reader, limits.max_bytes),
+        Err(error) => ClipboardRead::Error(format!("could not prepare clipboard reader: {error}")),
+    }
 }
 
 fn read_text(reader: impl Read, max_bytes: u64) -> ClipboardRead {
@@ -181,14 +276,14 @@ fn read_text(reader: impl Read, max_bytes: u64) -> ClipboardRead {
 
 pub(crate) fn perform_action(
     action: ClipboardAction,
-    max_bytes: u64,
+    limits: ReadLimits,
     notifications: bool,
     debug: bool,
 ) -> Result<(), String> {
     apply_action(
         action,
         debug,
-        |clipboard| read(clipboard, max_bytes),
+        |clipboard| read(clipboard, limits),
         write,
         write_switch_value,
         || clear(CopyClipboardType::Both, CopySeat::All).map_err(|error| error.to_string()),
@@ -418,6 +513,10 @@ pub(crate) fn write(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+
+    const BRIEF: Duration = Duration::from_millis(50);
 
     fn unreadable_states() -> Vec<ClipboardRead> {
         vec![
@@ -743,6 +842,48 @@ mod tests {
         )
         .unwrap();
         assert_eq!(clears, 1);
+    }
+
+    #[test]
+    fn a_silent_writer_does_not_stall_the_read_forever() {
+        // The writer stays open and never sends, which is what a hung clipboard owner
+        // looks like: without a deadline this read would never return.
+        let (reader, _writer) = UnixStream::pair().unwrap();
+        let mut reader = DeadlineReader::new(reader, BRIEF).unwrap();
+        assert_eq!(
+            reader.read(&mut [0; 8]).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
+    fn a_timed_out_read_is_reported_as_an_error() {
+        let (reader, _writer) = UnixStream::pair().unwrap();
+        let reader = DeadlineReader::new(reader, BRIEF).unwrap();
+        let ClipboardRead::Error(error) = read_text(reader, 1024) else {
+            panic!("a timed out read must not be mistaken for content");
+        };
+        assert!(error.contains("timed out"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn a_stalled_writer_never_yields_partial_content() {
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(b"partial").unwrap();
+        let reader = DeadlineReader::new(reader, BRIEF).unwrap();
+        assert!(matches!(read_text(reader, 1024), ClipboardRead::Error(_)));
+    }
+
+    #[test]
+    fn content_delivered_before_the_deadline_reads_normally() {
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all("é🙂 value".as_bytes()).unwrap();
+        drop(writer);
+        let reader = DeadlineReader::new(reader, Duration::from_secs(30)).unwrap();
+        assert_eq!(
+            read_text(reader, 1024),
+            ClipboardRead::Text("é🙂 value".into())
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@ use ksni::ToolTip;
 use tokio::sync::mpsc;
 
 use crate::clipboard::{
-    ActionRequest, ActionSource, ClearTarget, ClipboardAction, ClipboardRead, read_both,
+    ActionRequest, ActionSource, ClearTarget, ClipboardAction, ClipboardRead, ReadLimits, read_both,
 };
 use crate::stack::{StackAction, StackEntry};
 
@@ -41,7 +41,7 @@ pub(crate) struct ClipboardTray {
     pub(crate) editor_enabled: bool,
     pub(crate) editor_target: Option<EditTarget>,
     pub(crate) stack_enabled: bool,
-    pub(crate) max_clipboard_bytes: u64,
+    pub(crate) read_limits: ReadLimits,
 }
 
 impl ksni::Tray for ClipboardTray {
@@ -299,7 +299,7 @@ impl ksni::Tray for ClipboardTray {
         menu
     }
     fn menu_about_to_show(&mut self) {
-        (self.primary, self.regular) = read_both(self.max_clipboard_bytes);
+        (self.primary, self.regular) = read_both(self.read_limits);
     }
 }
 
@@ -390,7 +390,10 @@ mod tests {
                 editor_enabled: true,
                 editor_target: None,
                 stack_enabled: true,
-                max_clipboard_bytes: 1024,
+                read_limits: ReadLimits {
+                    max_bytes: 1024,
+                    timeout: std::time::Duration::from_secs(5),
+                },
             },
             event_receiver,
         )

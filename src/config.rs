@@ -6,6 +6,8 @@ use crate::clipboard::ClipboardAction;
 
 const DEFAULT_POLLING_PERIOD_MS: u64 = 1_000;
 const DEFAULT_MAX_CONTENT_BYTES: u64 = 1024 * 1024;
+const DEFAULT_READ_TIMEOUT_MS: u64 = 5_000;
+const MAX_READ_TIMEOUT_MS: u64 = 600_000;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -28,6 +30,7 @@ impl UpdateMethod {
 pub(crate) struct Config {
     pub(crate) update_method: UpdateMethod,
     pub(crate) polling_period_ms: u64,
+    pub(crate) read_timeout_ms: u64,
     pub(crate) hide_content: bool,
     pub(crate) notifications: bool,
     pub(crate) notify_on_change: bool,
@@ -46,6 +49,7 @@ impl Default for Config {
         Self {
             update_method: UpdateMethod::Events,
             polling_period_ms: DEFAULT_POLLING_PERIOD_MS,
+            read_timeout_ms: DEFAULT_READ_TIMEOUT_MS,
             hide_content: false,
             notifications: false,
             notify_on_change: false,
@@ -101,6 +105,12 @@ fn parse(contents: &str, path: &Path) -> Result<Config, String> {
     if config.polling_period_ms == 0 {
         return Err(format!(
             "{}: polling_period_ms must be greater than zero",
+            path.display()
+        ));
+    }
+    if !(1..=MAX_READ_TIMEOUT_MS).contains(&config.read_timeout_ms) {
+        return Err(format!(
+            "{}: read_timeout_ms must be between 1 and {MAX_READ_TIMEOUT_MS}",
             path.display()
         ));
     }
@@ -187,6 +197,22 @@ mod tests {
         assert!(parse("icon_name = '  '", Path::new("config.toml")).is_err());
         assert!(parse("stack_size = 0", Path::new("config.toml")).is_err());
         assert!(parse("stack_size = 17", Path::new("config.toml")).is_err());
+    }
+
+    #[test]
+    fn validates_read_timeout() {
+        let config = parse("read_timeout_ms = 250", Path::new("config.toml")).unwrap();
+        assert_eq!(config.read_timeout_ms, 250);
+        assert_eq!(Config::default().read_timeout_ms, DEFAULT_READ_TIMEOUT_MS);
+        assert!(parse("read_timeout_ms = 0", Path::new("config.toml")).is_err());
+        // An unbounded timeout would overflow the deadline instant it is added to.
+        assert!(
+            parse(
+                &format!("read_timeout_ms = {}", MAX_READ_TIMEOUT_MS + 1),
+                Path::new("config.toml")
+            )
+            .is_err()
+        );
     }
 
     #[test]
