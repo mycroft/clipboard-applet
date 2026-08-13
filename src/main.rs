@@ -22,11 +22,14 @@ use wl_clipboard_rs::copy::ClipboardType as CopyClipboardType;
 use wl_clipboard_rs::paste::ClipboardType;
 
 use cli::{CliAction, parse_args, print_help};
-use clipboard::{ClipboardRead, ReadLimits, perform_action, perform_clear, read, read_both, write};
+use clipboard::{
+    ClipboardRead, ReadLimits, ServingFailure, perform_action, perform_clear, read, read_both,
+    write,
+};
 use clipboard_monitor::MonitorEvent;
 use config::UpdateMethod;
 use notification::{clipboard_change, send_change, settings as notification_settings};
-use stack::{StackEntry, perform as perform_stack_action};
+use stack::{StackEntry, StackLimits, perform as perform_stack_action};
 use tray::{AppEvent, ClipboardTray, EditTarget, tooltip_text};
 
 type EditorResult = Result<(EditTarget, String, String), String>;
@@ -112,6 +115,7 @@ async fn main() {
     }
 
     let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+    let (serving_failure_sender, mut serving_failure_receiver) = mpsc::unbounded_channel();
     let (monitor_sender, mut monitor_receiver) = mpsc::channel(1);
     let mut stack = Vec::new();
     let mut previous_clipboards = (None, None);
@@ -191,7 +195,8 @@ async fn main() {
                         if debug {
                             eprintln!("[debug] action requested: action={}, source={:?}", request.action.name(), request.source);
                         }
-                        let result = tokio::task::spawn_blocking(move || perform_action(request.action, read_limits, notifications_enabled, debug)).await;
+                        let failure_sender = serving_failure_sender.clone();
+                        let result = tokio::task::spawn_blocking(move || perform_action(request.action, read_limits, notifications_enabled, debug, failure_sender)).await;
                         match result {
                             Ok(Ok(())) if debug => eprintln!("[debug] action completed: {}", request.action.name()),
                             Ok(Ok(())) => {}
@@ -201,17 +206,20 @@ async fn main() {
                     }
                     AppEvent::Stack(action) => {
                         let mut current_stack = std::mem::take(&mut stack);
-                        let capacity = config.stack_size;
-                        let max_entry_bytes = config.max_stack_entry_bytes;
+                        let stack_limits = StackLimits {
+                            capacity: config.stack_size,
+                            clipboard: read_limits,
+                            max_entry_bytes: config.max_stack_entry_bytes,
+                        };
+                        let failure_sender = serving_failure_sender.clone();
                         let result = tokio::task::spawn_blocking(move || {
                             let result = perform_stack_action(
                                 action,
                                 &mut current_stack,
-                                capacity,
-                                read_limits,
-                                max_entry_bytes,
+                                stack_limits,
                                 notifications_enabled,
                                 debug,
+                                failure_sender,
                             );
                             (result, current_stack)
                         }).await;
@@ -276,6 +284,9 @@ async fn main() {
                     }
                 }
             }
+            Some(failure) = serving_failure_receiver.recv() => {
+                report_serving_failure(failure, notifications_enabled, debug).await;
+            }
             result = wait_for_editor(&mut editor_session) => {
                 editor_session = None;
                 match result {
@@ -287,6 +298,7 @@ async fn main() {
                             &mut stack,
                             notifications_enabled,
                             debug,
+                            serving_failure_sender.clone(),
                         ).await {
                             eprintln!("could not edit clipboard value: {error}");
                         }
@@ -384,6 +396,7 @@ async fn apply_edit(
     stack: &mut [StackEntry],
     notifications: bool,
     debug: bool,
+    failure_sender: mpsc::UnboundedSender<ServingFailure>,
 ) -> Result<(), String> {
     match target {
         EditTarget::Primary | EditTarget::Regular => {
@@ -393,7 +406,7 @@ async fn apply_edit(
                     EditTarget::Regular => CopyClipboardType::Regular,
                     EditTarget::Stack(_) => unreachable!(),
                 };
-                write(clipboard, edited, debug)
+                write(clipboard, edited, debug, "EDIT", failure_sender)
             })
             .await
             .map_err(|error| format!("clipboard writer stopped unexpectedly: {error}"))??;
@@ -410,6 +423,30 @@ async fn apply_edit(
         eprintln!("[debug] edit notification sent: target={target:?}");
     }
     Ok(())
+}
+
+async fn report_serving_failure(failure: ServingFailure, notifications: bool, debug: bool) {
+    eprintln!(
+        "clipboard-serving failure: selection={}, operation={}, error={}",
+        failure.selection, failure.operation, failure.error
+    );
+    if notifications {
+        let body = format!(
+            "Could not keep serving the {} clipboard ({})",
+            failure.selection, failure.operation
+        );
+        let sent = tokio::task::spawn_blocking(move || {
+            notification::send(&body, "clipboard-serving failure")
+        })
+        .await
+        .unwrap_or(false);
+        if sent && debug {
+            eprintln!(
+                "[debug] clipboard-serving failure notification sent: selection={}, operation={}",
+                failure.selection, failure.operation
+            );
+        }
+    }
 }
 
 async fn send_edit_notification<F>(send: F) -> Result<bool, String>

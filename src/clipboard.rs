@@ -1,8 +1,10 @@
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, RawFd};
+use std::sync::mpsc::sync_channel;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
+use tokio::sync::mpsc;
 use wl_clipboard_rs::copy::{
     ClipboardType as CopyClipboardType, MimeType as CopyMimeType, Options, Seat as CopySeat,
     Source, clear,
@@ -54,6 +56,13 @@ pub(crate) enum ClearTarget {
 pub(crate) struct ReadLimits {
     pub(crate) max_bytes: u64,
     pub(crate) timeout: Duration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ServingFailure {
+    pub(crate) selection: &'static str,
+    pub(crate) operation: &'static str,
+    pub(crate) error: String,
 }
 
 /// Bounds a blocking read by a deadline.
@@ -270,13 +279,17 @@ pub(crate) fn perform_action(
     limits: ReadLimits,
     notifications: bool,
     debug: bool,
+    failure_sender: mpsc::UnboundedSender<ServingFailure>,
 ) -> Result<(), String> {
+    let operation = action.name();
     apply_action(
         action,
         debug,
         |clipboard| read(clipboard, limits),
-        write,
-        write_switch_value,
+        |clipboard, value, debug| write(clipboard, value, debug, operation, failure_sender.clone()),
+        |clipboard, value, debug| {
+            write_switch_value(clipboard, value, debug, operation, failure_sender.clone())
+        },
         || clear(CopyClipboardType::Both, CopySeat::All).map_err(|error| error.to_string()),
     )?;
     let notification_sent =
@@ -414,9 +427,11 @@ fn write_switch_value(
     clipboard: CopyClipboardType,
     value: SwitchValue,
     debug: bool,
+    operation: &'static str,
+    failure_sender: mpsc::UnboundedSender<ServingFailure>,
 ) -> Result<(), String> {
     match value {
-        SwitchValue::Text(value) => write(clipboard, value, debug),
+        SwitchValue::Text(value) => write(clipboard, value, debug, operation, failure_sender),
         SwitchValue::Empty => {
             if debug {
                 eprintln!("[debug] clearing switch destination: {clipboard:?}");
@@ -483,6 +498,8 @@ pub(crate) fn write(
     clipboard: CopyClipboardType,
     value: String,
     debug: bool,
+    operation: &'static str,
+    failure_sender: mpsc::UnboundedSender<ServingFailure>,
 ) -> Result<(), String> {
     if debug {
         eprintln!(
@@ -490,11 +507,72 @@ pub(crate) fn write(
             value.chars().count()
         );
     }
-    let mut options = Options::new();
-    options.clipboard(clipboard);
-    options
-        .copy(Source::Bytes(value.into_bytes().into()), CopyMimeType::Text)
-        .map_err(|error| error.to_string())
+    spawn_server(clipboard, operation, failure_sender, debug, move || {
+        let mut options = Options::new();
+        options.clipboard(clipboard).foreground(true);
+        let prepared = options
+            .prepare_copy(Source::Bytes(value.into_bytes().into()), CopyMimeType::Text)
+            .map_err(|error| error.to_string())?;
+        Ok(move || prepared.serve().map_err(|error| error.to_string()))
+    })
+}
+
+fn spawn_server<FPrepare, FServe>(
+    clipboard: CopyClipboardType,
+    operation: &'static str,
+    failure_sender: mpsc::UnboundedSender<ServingFailure>,
+    debug: bool,
+    prepare: FPrepare,
+) -> Result<(), String>
+where
+    FPrepare: FnOnce() -> Result<FServe, String> + Send + 'static,
+    FServe: FnOnce() -> Result<(), String> + 'static,
+{
+    let (started_sender, started_receiver) = sync_channel(1);
+    std::thread::Builder::new()
+        .name("clipboard-server".into())
+        .spawn(move || match prepare() {
+            Ok(serve) => {
+                let serving_error = if started_sender.send(Ok(())).is_err() {
+                    None
+                } else {
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(serve)) {
+                        Ok(Ok(())) => None,
+                        Ok(Err(error)) => Some(error),
+                        Err(_) => Some("clipboard-serving worker panicked".into()),
+                    }
+                };
+                if let Some(error) = serving_error {
+                    let _ = failure_sender.send(ServingFailure {
+                        selection: selection_name(clipboard),
+                        operation,
+                        error,
+                    });
+                }
+            }
+            Err(error) => {
+                let _ = started_sender.send(Err(error));
+            }
+        })
+        .map_err(|error| format!("could not start clipboard-serving worker: {error}"))?;
+    let result = started_receiver
+        .recv()
+        .map_err(|_| "clipboard-serving worker stopped during startup".to_string())?;
+    if result.is_ok() && debug {
+        eprintln!(
+            "[debug] clipboard-serving worker started: selection={}, operation={operation}",
+            selection_name(clipboard)
+        );
+    }
+    result
+}
+
+fn selection_name(clipboard: CopyClipboardType) -> &'static str {
+    match clipboard {
+        CopyClipboardType::Primary => "primary",
+        CopyClipboardType::Regular => "regular",
+        CopyClipboardType::Both => "primary and regular",
+    }
 }
 
 #[cfg(test)]
@@ -502,8 +580,59 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::unix::net::UnixStream;
+    use std::time::Duration;
 
     const BRIEF: Duration = Duration::from_millis(50);
+
+    #[test]
+    fn serving_worker_reports_background_failure_context() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        spawn_server(CopyClipboardType::Regular, "EDIT", sender, false, || {
+            Ok(|| Err("paste failed".into()))
+        })
+        .unwrap();
+        assert_eq!(
+            receiver.blocking_recv(),
+            Some(ServingFailure {
+                selection: "regular",
+                operation: "EDIT",
+                error: "paste failed".into(),
+            })
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn serving_worker_returns_startup_failure_synchronously() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let result = spawn_server::<_, fn() -> Result<(), String>>(
+            CopyClipboardType::Primary,
+            "COPY_REGULAR",
+            sender,
+            false,
+            || Err("prepare failed".into()),
+        );
+        assert_eq!(result, Err("prepare failed".into()));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn serving_worker_reports_panics_and_exits() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        spawn_server(CopyClipboardType::Primary, "SWITCH", sender, false, || {
+            Ok(|| -> Result<(), String> { panic!("unexpected worker panic") })
+        })
+        .unwrap();
+        assert_eq!(
+            receiver.blocking_recv(),
+            Some(ServingFailure {
+                selection: "primary",
+                operation: "SWITCH",
+                error: "clipboard-serving worker panicked".into(),
+            })
+        );
+        assert!(receiver.try_recv().is_err());
+    }
 
     fn unreadable_states() -> Vec<ClipboardRead> {
         vec![

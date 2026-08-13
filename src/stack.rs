@@ -1,9 +1,12 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use tokio::sync::mpsc;
 use wl_clipboard_rs::copy::{ClipboardType as CopyClipboardType, Seat as CopySeat, clear};
 use wl_clipboard_rs::paste::ClipboardType;
 
-use crate::clipboard::{ClipboardRead, ReadLimits, read, write, write_both_with_rollback};
+use crate::clipboard::{
+    ClipboardRead, ReadLimits, ServingFailure, read, write, write_both_with_rollback,
+};
 use crate::notification;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -21,6 +24,13 @@ pub(crate) struct StackEntry {
     pub(crate) value: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StackLimits {
+    pub(crate) capacity: usize,
+    pub(crate) clipboard: ReadLimits,
+    pub(crate) max_entry_bytes: u64,
+}
+
 impl StackEntry {
     pub(crate) fn new(value: String) -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -34,11 +44,10 @@ impl StackEntry {
 pub(crate) fn perform(
     action: StackAction,
     stack: &mut Vec<StackEntry>,
-    capacity: usize,
-    limits: ReadLimits,
-    max_entry_bytes: u64,
+    limits: StackLimits,
     notifications: bool,
     debug: bool,
+    failure_sender: mpsc::UnboundedSender<ServingFailure>,
 ) -> Result<(), String> {
     match action {
         StackAction::PushPrimary | StackAction::PushRegular => {
@@ -47,7 +56,7 @@ pub(crate) fn perform(
             } else {
                 ClipboardType::Regular
             };
-            let source = read(clipboard, limits);
+            let source = read(clipboard, limits.clipboard);
             if debug {
                 eprintln!(
                     "[debug] stack push: source={clipboard:?}, state={}, length={} chars",
@@ -76,15 +85,15 @@ pub(crate) fn perform(
                     return Err(format!("could not read source clipboard: {error}"));
                 }
             };
-            validate_entry_size(&value, max_entry_bytes)?;
-            push(stack, value, capacity);
+            validate_entry_size(&value, limits.max_entry_bytes)?;
+            push(stack, value, limits.capacity);
         }
         StackAction::PopPrimary | StackAction::PopRegular => {
             let value = stack
                 .last()
                 .map(|entry| entry.value.clone())
                 .ok_or_else(|| "clipboard stack is empty".to_string())?;
-            validate_clipboard_size(&value, limits.max_bytes)?;
+            validate_clipboard_size(&value, limits.clipboard.max_bytes)?;
             let clipboard = if action == StackAction::PopPrimary {
                 CopyClipboardType::Primary
             } else {
@@ -96,15 +105,23 @@ pub(crate) fn perform(
                     value.chars().count()
                 );
             }
-            write(clipboard, value, debug)?;
+            write(clipboard, value, debug, "STACK_POP", failure_sender.clone())?;
             stack.pop();
         }
         StackAction::PopBoth => pop_to_both(
             stack,
             debug,
-            limits.max_bytes,
-            || read(ClipboardType::Primary, limits),
-            write_optional,
+            limits.clipboard.max_bytes,
+            || read(ClipboardType::Primary, limits.clipboard),
+            |clipboard, value, debug| {
+                write_optional(
+                    clipboard,
+                    value,
+                    debug,
+                    "STACK_POP_BOTH",
+                    failure_sender.clone(),
+                )
+            },
         )?,
     }
     let notification_sent =
@@ -141,9 +158,11 @@ fn write_optional(
     clipboard: CopyClipboardType,
     value: Option<String>,
     debug: bool,
+    operation: &'static str,
+    failure_sender: mpsc::UnboundedSender<ServingFailure>,
 ) -> Result<(), String> {
     match value {
-        Some(value) => write(clipboard, value, debug),
+        Some(value) => write(clipboard, value, debug, operation, failure_sender),
         None => clear(clipboard, CopySeat::All).map_err(|error| error.to_string()),
     }
 }
