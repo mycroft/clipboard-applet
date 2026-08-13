@@ -29,7 +29,7 @@ use clipboard::{
 use clipboard_monitor::MonitorEvent;
 use config::UpdateMethod;
 use notification::{clipboard_change, send_change, settings as notification_settings};
-use stack::{StackEntry, StackLimits, perform as perform_stack_action};
+use stack::{StackEntry, StackLimits, copy_entry, perform as perform_stack_action};
 use tray::{AppEvent, ClipboardTray, EditTarget, tooltip_text};
 
 type EditorResult = Result<(EditTarget, String, String), String>;
@@ -229,6 +229,25 @@ async fn main() {
                                 if let Err(error) = result { eprintln!("could not perform stack action: {error}"); }
                             }
                             Err(error) => eprintln!("clipboard stack action stopped unexpectedly: {error}"),
+                        }
+                    }
+                    AppEvent::CopyStack(request) => {
+                        let current_stack = stack.clone();
+                        let max_clipboard_bytes = read_limits.max_bytes;
+                        let failure_sender = serving_failure_sender.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            copy_entry(
+                                request,
+                                &current_stack,
+                                max_clipboard_bytes,
+                                notifications_enabled,
+                                debug,
+                                failure_sender,
+                            )
+                        }).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => eprintln!("could not copy stacked entry: {error}"),
+                            Err(error) => eprintln!("stack copy stopped unexpectedly: {error}"),
                         }
                     }
                     AppEvent::Clear(target) => {

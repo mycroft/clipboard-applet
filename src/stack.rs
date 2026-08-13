@@ -18,6 +18,18 @@ pub(crate) enum StackAction {
     PopBoth,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StackCopyRequest {
+    pub(crate) id: u64,
+    pub(crate) destination: StackCopyDestination,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StackCopyDestination {
+    Primary,
+    Regular,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StackEntry {
     pub(crate) id: u64,
@@ -132,6 +144,72 @@ pub(crate) fn perform(
         eprintln!("[debug] stack notification skipped: disabled");
     }
     Ok(())
+}
+
+pub(crate) fn copy_entry(
+    request: StackCopyRequest,
+    stack: &[StackEntry],
+    max_clipboard_bytes: u64,
+    notifications: bool,
+    debug: bool,
+    failure_sender: mpsc::UnboundedSender<ServingFailure>,
+) -> Result<(), String> {
+    copy_entry_with(
+        request,
+        stack,
+        max_clipboard_bytes,
+        debug,
+        |clipboard, value, debug| {
+            write(
+                clipboard,
+                value,
+                debug,
+                "STACK_COPY",
+                failure_sender.clone(),
+            )
+        },
+    )?;
+    let body = match request.destination {
+        StackCopyDestination::Primary => "Stacked entry copied to primary",
+        StackCopyDestination::Regular => "Stacked entry copied to regular",
+    };
+    let sent = notification::send_if_enabled(body, "clipboard stack", notifications);
+    if sent && debug {
+        eprintln!(
+            "[debug] stack copy notification sent: destination={:?}",
+            request.destination
+        );
+    }
+    Ok(())
+}
+
+fn copy_entry_with<FWrite>(
+    request: StackCopyRequest,
+    stack: &[StackEntry],
+    max_clipboard_bytes: u64,
+    debug: bool,
+    mut write: FWrite,
+) -> Result<(), String>
+where
+    FWrite: FnMut(CopyClipboardType, String, bool) -> Result<(), String>,
+{
+    let entry = stack
+        .iter()
+        .find(|entry| entry.id == request.id)
+        .ok_or_else(|| "stacked entry no longer exists".to_string())?;
+    validate_clipboard_size(&entry.value, max_clipboard_bytes)?;
+    if debug {
+        eprintln!(
+            "[debug] stack copy: destination={:?}, length={} chars",
+            request.destination,
+            entry.value.chars().count()
+        );
+    }
+    let destination = match request.destination {
+        StackCopyDestination::Primary => CopyClipboardType::Primary,
+        StackCopyDestination::Regular => CopyClipboardType::Regular,
+    };
+    write(destination, entry.value.clone(), debug)
 }
 
 fn validate_entry_size(value: &str, max_bytes: u64) -> Result<(), String> {
@@ -275,6 +353,61 @@ mod tests {
         assert!(validate_clipboard_size("123", 4).is_ok());
         assert!(validate_clipboard_size("1234", 4).is_ok());
         assert!(validate_clipboard_size("12345", 4).is_err());
+    }
+
+    #[test]
+    fn copy_entry_writes_each_destination_without_changing_stack() {
+        let stack = vec![entry("oldest"), entry("selected"), entry("newest")];
+        let selected_id = stack[1].id;
+        for (destination, expected_clipboard) in [
+            (StackCopyDestination::Primary, CopyClipboardType::Primary),
+            (StackCopyDestination::Regular, CopyClipboardType::Regular),
+        ] {
+            let mut writes = Vec::new();
+            copy_entry_with(
+                StackCopyRequest {
+                    id: selected_id,
+                    destination,
+                },
+                &stack,
+                1024,
+                false,
+                |clipboard, value, _| {
+                    writes.push((clipboard, value));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(writes, [(expected_clipboard, "selected".into())]);
+            assert_eq!(values(&stack), ["oldest", "selected", "newest"]);
+        }
+    }
+
+    #[test]
+    fn copy_entry_rejects_stale_and_oversized_targets() {
+        let stack = vec![entry("value")];
+        let mut writes = Vec::new();
+        for (id, limit, expected) in [
+            (u64::MAX, 1024, "no longer exists"),
+            (stack[0].id, 4, "too large"),
+        ] {
+            let result = copy_entry_with(
+                StackCopyRequest {
+                    id,
+                    destination: StackCopyDestination::Primary,
+                },
+                &stack,
+                limit,
+                false,
+                |clipboard, value, _| {
+                    writes.push((clipboard, value));
+                    Ok(())
+                },
+            );
+            assert!(result.unwrap_err().contains(expected));
+        }
+        assert!(writes.is_empty());
+        assert_eq!(values(&stack), ["value"]);
     }
 
     #[test]
