@@ -1,11 +1,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use wl_clipboard_rs::copy::ClipboardType as CopyClipboardType;
+use wl_clipboard_rs::copy::{ClipboardType as CopyClipboardType, Seat as CopySeat, clear};
 use wl_clipboard_rs::paste::ClipboardType;
 
-use crate::clipboard::{
-    ClipboardRead, ReadLimits, length, read, try_read_both, write, write_both_with_rollback,
-};
+use crate::clipboard::{ClipboardRead, ReadLimits, read, write, write_both_with_rollback};
 use crate::notification;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -102,8 +100,8 @@ pub(crate) fn perform(
             stack,
             debug,
             limits.max_bytes,
-            || try_read_both(limits),
-            write,
+            || read(ClipboardType::Primary, limits),
+            write_optional,
         )?,
     }
     let notification_sent =
@@ -136,6 +134,17 @@ fn validate_clipboard_size(value: &str, max_bytes: u64) -> Result<(), String> {
     Ok(())
 }
 
+fn write_optional(
+    clipboard: CopyClipboardType,
+    value: Option<String>,
+    debug: bool,
+) -> Result<(), String> {
+    match value {
+        Some(value) => write(clipboard, value, debug),
+        None => clear(clipboard, CopySeat::All).map_err(|error| error.to_string()),
+    }
+}
+
 fn pop_to_both<FRead, FWrite>(
     stack: &mut Vec<StackEntry>,
     debug: bool,
@@ -144,27 +153,50 @@ fn pop_to_both<FRead, FWrite>(
     write: FWrite,
 ) -> Result<(), String>
 where
-    FRead: FnOnce() -> Result<(Option<String>, Option<String>), String>,
-    FWrite: FnMut(CopyClipboardType, String, bool) -> Result<(), String>,
+    FRead: FnOnce() -> ClipboardRead,
+    FWrite: FnMut(CopyClipboardType, Option<String>, bool) -> Result<(), String>,
 {
     let value = stack
         .last()
         .map(|entry| entry.value.clone())
         .ok_or_else(|| "clipboard stack is empty".to_string())?;
     validate_clipboard_size(&value, max_clipboard_bytes)?;
-    let (original_primary, original_regular) = read()?;
-    let original_primary = original_primary.ok_or_else(|| {
-        "cannot safely pop to both when the primary clipboard has no readable text".to_string()
-    })?;
+    let original_primary = match read() {
+        ClipboardRead::Text(value) => Some(value),
+        ClipboardRead::Empty => None,
+        ClipboardRead::NonText => {
+            return Err("cannot safely pop to both when the primary clipboard is non-text".into());
+        }
+        ClipboardRead::Unsupported => {
+            return Err(
+                "cannot safely pop to both when the primary clipboard is unsupported".into(),
+            );
+        }
+        ClipboardRead::Oversized { limit } => {
+            return Err(format!(
+                "cannot safely pop to both when the primary clipboard exceeds the configured {limit}-byte limit"
+            ));
+        }
+        ClipboardRead::Error(error) => {
+            return Err(format!("could not read primary clipboard: {error}"));
+        }
+    };
     if debug {
         eprintln!(
-            "[debug] stack pop: destination=Primary+Regular, length={} chars, original_primary={} chars, original_regular={} chars",
+            "[debug] stack pop: destination=Primary+Regular, length={} chars, original_primary={} chars",
             value.chars().count(),
-            original_primary.chars().count(),
-            length(original_regular.as_deref())
+            original_primary
+                .as_deref()
+                .map_or(0, |value| value.chars().count())
         );
     }
-    write_both_with_rollback(value.clone(), value, original_primary, debug, write)?;
+    write_both_with_rollback(
+        Some(value.clone()),
+        Some(value),
+        original_primary,
+        debug,
+        write,
+    )?;
     stack.pop();
     Ok(())
 }
@@ -227,7 +259,7 @@ mod tests {
             &mut stack,
             false,
             1024,
-            || Ok((Some("old".into()), None)),
+            || ClipboardRead::Text("old".into()),
             |clipboard, _, _| {
                 if clipboard == CopyClipboardType::Regular {
                     Err("boom".into())
@@ -241,20 +273,68 @@ mod tests {
     }
 
     #[test]
-    fn pop_to_both_does_not_write_without_safe_rollback_text() {
+    fn pop_to_both_supports_an_empty_primary() {
+        let mut stack = vec![entry("value")];
+        let mut writes = Vec::new();
+        pop_to_both(
+            &mut stack,
+            false,
+            1024,
+            || ClipboardRead::Empty,
+            |clipboard, value, _| {
+                writes.push((clipboard, value));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            writes,
+            [
+                (CopyClipboardType::Primary, Some("value".into())),
+                (CopyClipboardType::Regular, Some("value".into())),
+            ]
+        );
+        assert!(stack.is_empty());
+    }
+
+    #[test]
+    fn failed_pop_to_both_restores_an_empty_primary() {
         let mut stack = vec![entry("value")];
         let mut writes = Vec::new();
         let result = pop_to_both(
             &mut stack,
             false,
             1024,
-            || Ok((None, Some("regular".into()))),
+            || ClipboardRead::Empty,
+            |clipboard, value, _| {
+                writes.push((clipboard, value));
+                if writes.len() == 2 {
+                    Err("boom".into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(result.unwrap_err().contains("primary clipboard restored"));
+        assert_eq!(writes[2], (CopyClipboardType::Primary, None));
+        assert_eq!(values(&stack), ["value"]);
+    }
+
+    #[test]
+    fn pop_to_both_does_not_overwrite_non_text_primary_content() {
+        let mut stack = vec![entry("value")];
+        let mut writes = Vec::new();
+        let result = pop_to_both(
+            &mut stack,
+            false,
+            1024,
+            || ClipboardRead::NonText,
             |clipboard, value, _| {
                 writes.push((clipboard, value));
                 Ok(())
             },
         );
-        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("non-text"));
         assert!(writes.is_empty());
         assert_eq!(values(&stack), ["value"]);
     }

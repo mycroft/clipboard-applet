@@ -210,17 +210,6 @@ impl ClipboardRead {
     pub(crate) fn into_editable(self, source: &str) -> Result<String, String> {
         self.into_text(source)
     }
-
-    fn into_display(self) -> Result<Option<String>, String> {
-        match self {
-            Self::Text(value) => Ok(Some(value)),
-            Self::Empty | Self::NonText | Self::Unsupported => Ok(None),
-            Self::Oversized { limit } => Err(format!(
-                "clipboard content exceeds the configured {limit}-byte limit"
-            )),
-            Self::Error(error) => Err(error),
-        }
-    }
 }
 
 pub(crate) fn read_both(limits: ReadLimits) -> (ClipboardRead, ClipboardRead) {
@@ -232,13 +221,6 @@ where
     F: FnMut(ClipboardType) -> ClipboardRead,
 {
     (read(ClipboardType::Primary), read(ClipboardType::Regular))
-}
-
-pub(crate) fn try_read_both(
-    limits: ReadLimits,
-) -> Result<(Option<String>, Option<String>), String> {
-    let (primary, regular) = read_both(limits);
-    Ok((primary.into_display()?, regular.into_display()?))
 }
 
 pub(crate) fn read(clipboard: ClipboardType, limits: ReadLimits) -> ClipboardRead {
@@ -444,10 +426,6 @@ fn action_notification(action: ClipboardAction) -> &'static str {
     }
 }
 
-pub(crate) fn length(value: Option<&str>) -> usize {
-    value.map_or(0, |value| value.chars().count())
-}
-
 pub(crate) fn write_both_with_rollback<T, F>(
     primary: T,
     regular: T,
@@ -535,12 +513,6 @@ mod tests {
             ClipboardRead::Oversized { limit: 10 },
             ClipboardRead::Error("read failed".into()),
         ]
-    }
-
-    #[test]
-    fn counts_unicode_characters() {
-        assert_eq!(length(Some("é🙂")), 2);
-        assert_eq!(length(None), 0);
     }
 
     #[test]
