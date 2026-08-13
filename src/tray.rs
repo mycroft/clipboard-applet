@@ -2,7 +2,7 @@ use ksni::ToolTip;
 use tokio::sync::mpsc;
 
 use crate::clipboard::{ActionRequest, ActionSource, ClearTarget, ClipboardAction, ClipboardRead};
-use crate::stack::{StackAction, StackCopyDestination, StackCopyRequest, StackEntry};
+use crate::stack::{StackAction, StackEntry};
 
 const PREVIEW_CHARS: usize = 40;
 
@@ -10,7 +10,6 @@ const PREVIEW_CHARS: usize = 40;
 pub(crate) enum AppEvent {
     Action(ActionRequest),
     Stack(StackAction),
-    CopyStack(StackCopyRequest),
     Clear(ClearTarget),
     Edit(EditTarget),
     CancelEdit,
@@ -137,16 +136,6 @@ impl ksni::Tray for ClipboardTray {
             }
             .into()
         };
-        let copy_stack_item = |label: String, request: StackCopyRequest| {
-            StandardItem {
-                label,
-                activate: Box::new(move |tray: &mut Self| {
-                    let _ = tray.event_sender.send(AppEvent::CopyStack(request));
-                }),
-                ..Default::default()
-            }
-            .into()
-        };
         let any_content = has_content(&self.primary) || has_content(&self.regular);
         let switch_enabled =
             any_content && is_switchable(&self.primary) && is_switchable(&self.regular);
@@ -242,20 +231,6 @@ impl ksni::Tray for ClipboardTray {
                     .into(),
                 );
             } else {
-                for (display_index, entry) in self.stack.iter().rev().enumerate() {
-                    for (destination, name) in [
-                        (StackCopyDestination::Primary, "primary"),
-                        (StackCopyDestination::Regular, "regular"),
-                    ] {
-                        menu.push(copy_stack_item(
-                            format!("Copy entry {} to {name}", display_index + 1),
-                            StackCopyRequest {
-                                id: entry.id,
-                                destination,
-                            },
-                        ));
-                    }
-                }
                 if self.editor_enabled {
                     menu.extend(self.stack.iter().rev().enumerate().map(
                         |(display_index, entry)| {
@@ -592,33 +567,6 @@ mod tests {
         assert!(labels.iter().all(|label| !label.starts_with("Stack ")));
         assert!(labels.iter().all(|label| !label.starts_with("Pop to ")));
         assert!(labels.iter().all(|label| !label.starts_with("Edit 1:")));
-        assert!(labels.iter().all(|label| !label.starts_with("Copy entry ")));
         assert!(!labels.iter().any(|label| label == "No stacked entries yet"));
-    }
-
-    #[test]
-    fn stack_copy_menu_items_send_stable_targets() {
-        let (mut tray, mut receiver) = editable_tray();
-        let newest_id = tray.stack[1].id;
-        for (label, destination) in [
-            ("Copy entry 1 to primary", StackCopyDestination::Primary),
-            ("Copy entry 1 to regular", StackCopyDestination::Regular),
-        ] {
-            let item = ksni::Tray::menu(&tray)
-                .into_iter()
-                .find_map(|item| match item {
-                    ksni::MenuItem::Standard(item) if item.label == label => Some(item),
-                    _ => None,
-                })
-                .unwrap_or_else(|| panic!("missing menu item {label}"));
-            (item.activate)(&mut tray);
-            assert_eq!(
-                receiver.try_recv(),
-                Ok(AppEvent::CopyStack(StackCopyRequest {
-                    id: newest_id,
-                    destination,
-                }))
-            );
-        }
     }
 }
