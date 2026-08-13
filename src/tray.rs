@@ -344,6 +344,7 @@ fn preview(value: &ClipboardRead, hide: bool) -> String {
         ClipboardRead::NonText => "(non-text)".into(),
         ClipboardRead::Unsupported => "(unsupported)".into(),
         ClipboardRead::Oversized { limit } => format!("(over {limit} bytes)"),
+        ClipboardRead::Timeout => "(timed out)".into(),
         ClipboardRead::Error(_) => "(unavailable)".into(),
     }
 }
@@ -429,6 +430,7 @@ mod tests {
     fn preview_reports_each_unavailable_state_independently() {
         assert_eq!(preview(&ClipboardRead::NonText, false), "(non-text)");
         assert_eq!(preview(&ClipboardRead::Unsupported, false), "(unsupported)");
+        assert_eq!(preview(&ClipboardRead::Timeout, false), "(timed out)");
         assert_eq!(
             preview(&ClipboardRead::Oversized { limit: 1024 }, false),
             "(over 1024 bytes)"

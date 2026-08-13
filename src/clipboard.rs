@@ -145,6 +145,7 @@ pub(crate) enum ClipboardRead {
     NonText,
     Unsupported,
     Oversized { limit: u64 },
+    Timeout,
     Error(String),
 }
 
@@ -162,6 +163,7 @@ impl ClipboardRead {
             Self::NonText => "NonText",
             Self::Unsupported => "Unsupported",
             Self::Oversized { .. } => "Oversized",
+            Self::Timeout => "Timeout",
             Self::Error(_) => "Error",
         }
     }
@@ -177,7 +179,11 @@ impl ClipboardRead {
         match self {
             Self::Text(value) => Some(Some(value.clone())),
             Self::Empty => Some(None),
-            Self::NonText | Self::Unsupported | Self::Oversized { .. } | Self::Error(_) => None,
+            Self::NonText
+            | Self::Unsupported
+            | Self::Oversized { .. }
+            | Self::Timeout
+            | Self::Error(_) => None,
         }
     }
 
@@ -190,6 +196,7 @@ impl ClipboardRead {
             Self::Oversized { limit } => Err(format!(
                 "{source} clipboard exceeds the configured {limit}-byte limit"
             )),
+            Self::Timeout => Err(format!("timed out reading {source} clipboard")),
             Self::Error(error) => Err(format!("could not read {source} clipboard: {error}")),
         }
     }
@@ -203,6 +210,7 @@ impl ClipboardRead {
             Self::Oversized { limit } => Err(format!(
                 "{source} clipboard exceeds the configured {limit}-byte limit"
             )),
+            Self::Timeout => Err(format!("timed out reading {source} clipboard")),
             Self::Error(error) => Err(format!("could not read {source} clipboard: {error}")),
         }
     }
@@ -252,6 +260,7 @@ fn read_text(reader: impl Read, max_bytes: u64) -> ClipboardRead {
             Ok(value) => ClipboardRead::Text(value),
             Err(_) => ClipboardRead::NonText,
         },
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => ClipboardRead::Timeout,
         Err(error) => ClipboardRead::Error(format!("could not receive contents: {error}")),
     }
 }
@@ -502,6 +511,7 @@ mod tests {
             ClipboardRead::NonText,
             ClipboardRead::Unsupported,
             ClipboardRead::Oversized { limit: 10 },
+            ClipboardRead::Timeout,
             ClipboardRead::Error("read failed".into()),
         ]
     }
@@ -511,6 +521,7 @@ mod tests {
             ClipboardRead::NonText,
             ClipboardRead::Unsupported,
             ClipboardRead::Oversized { limit: 10 },
+            ClipboardRead::Timeout,
             ClipboardRead::Error("read failed".into()),
         ]
     }
@@ -544,6 +555,7 @@ mod tests {
         assert_eq!(ClipboardRead::NonText.state(), "NonText");
         assert_eq!(ClipboardRead::Unsupported.state(), "Unsupported");
         assert_eq!(ClipboardRead::Oversized { limit: 10 }.state(), "Oversized");
+        assert_eq!(ClipboardRead::Timeout.state(), "Timeout");
         assert_eq!(ClipboardRead::Error("failed".into()).state(), "Error");
     }
 
@@ -829,13 +841,10 @@ mod tests {
     }
 
     #[test]
-    fn a_timed_out_read_is_reported_as_an_error() {
+    fn a_timed_out_read_has_a_distinct_state() {
         let (reader, _writer) = UnixStream::pair().unwrap();
         let reader = DeadlineReader::new(reader, BRIEF).unwrap();
-        let ClipboardRead::Error(error) = read_text(reader, 1024) else {
-            panic!("a timed out read must not be mistaken for content");
-        };
-        assert!(error.contains("timed out"), "unexpected error: {error}");
+        assert_eq!(read_text(reader, 1024), ClipboardRead::Timeout);
     }
 
     #[test]
@@ -843,7 +852,7 @@ mod tests {
         let (reader, mut writer) = UnixStream::pair().unwrap();
         writer.write_all(b"partial").unwrap();
         let reader = DeadlineReader::new(reader, BRIEF).unwrap();
-        assert!(matches!(read_text(reader, 1024), ClipboardRead::Error(_)));
+        assert_eq!(read_text(reader, 1024), ClipboardRead::Timeout);
     }
 
     #[test]

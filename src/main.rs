@@ -39,6 +39,7 @@ struct EditorSession {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ClipboardReadIssue {
     Oversized { limit: u64 },
+    Timeout,
     Error(String),
 }
 
@@ -462,6 +463,9 @@ fn report_read_transition(
         Some(ReadLogTransition::Issue(ClipboardReadIssue::Oversized { limit })) => {
             eprintln!("could not read {selection} clipboard: content exceeds {limit} bytes");
         }
+        Some(ReadLogTransition::Issue(ClipboardReadIssue::Timeout)) => {
+            eprintln!("could not read {selection} clipboard: timed out");
+        }
         Some(ReadLogTransition::Issue(ClipboardReadIssue::Error(error))) => {
             eprintln!("could not read {selection} clipboard: {error}");
         }
@@ -478,6 +482,7 @@ fn read_log_transition(
 ) -> Option<ReadLogTransition> {
     let current = match value {
         ClipboardRead::Oversized { limit } => Some(ClipboardReadIssue::Oversized { limit: *limit }),
+        ClipboardRead::Timeout => Some(ClipboardReadIssue::Timeout),
         ClipboardRead::Error(error) => Some(ClipboardReadIssue::Error(error.clone())),
         ClipboardRead::Text(_) | ClipboardRead::Empty => {
             return previous.take().map(|_| ReadLogTransition::Recovered);
@@ -696,6 +701,29 @@ mod tests {
         assert_eq!(
             read_log_transition(&mut previous, &ClipboardRead::Empty),
             None
+        );
+    }
+
+    #[test]
+    fn timeout_is_distinct_from_other_errors_and_recovers() {
+        let mut previous = None;
+        assert_eq!(
+            read_log_transition(&mut previous, &ClipboardRead::Timeout),
+            Some(ReadLogTransition::Issue(ClipboardReadIssue::Timeout))
+        );
+        assert_eq!(
+            read_log_transition(&mut previous, &ClipboardRead::Timeout),
+            None
+        );
+        assert_eq!(
+            read_log_transition(&mut previous, &ClipboardRead::Error("failed".into())),
+            Some(ReadLogTransition::Issue(ClipboardReadIssue::Error(
+                "failed".into()
+            )))
+        );
+        assert_eq!(
+            read_log_transition(&mut previous, &ClipboardRead::Empty),
+            Some(ReadLogTransition::Recovered)
         );
     }
 

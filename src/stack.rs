@@ -69,6 +69,9 @@ pub(crate) fn perform(
                         "source clipboard exceeds the configured {limit}-byte limit"
                     ));
                 }
+                ClipboardRead::Timeout => {
+                    return Err("timed out reading source clipboard".into());
+                }
                 ClipboardRead::Error(error) => {
                     return Err(format!("could not read source clipboard: {error}"));
                 }
@@ -176,6 +179,9 @@ where
             return Err(format!(
                 "cannot safely pop to both when the primary clipboard exceeds the configured {limit}-byte limit"
             ));
+        }
+        ClipboardRead::Timeout => {
+            return Err("timed out reading primary clipboard".into());
         }
         ClipboardRead::Error(error) => {
             return Err(format!("could not read primary clipboard: {error}"));
